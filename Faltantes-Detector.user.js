@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Faltantes - Detector de entregas (Rappi / PedidosYa)
 // @namespace    faltantes-delivery
-// @version      1.1.1
+// @version      1.1.2
 // @description  Lee que pedidos siguen activos en las paginas de Rappi y PedidosYa y le avisa a Faltantes para retirar solos los ya entregados.
 // @author       Erick R.
 // @match        https://aliados.rappi.com/*
@@ -22,6 +22,7 @@
   var host = (location.host || '');
   var PLATAFORMA = /rappi/i.test(host) ? 'Rappi' : (/restaurant-partners/i.test(host) ? 'PedidosYa' : '');
   var ultimaFirma = null, ultimasClaves = [];
+  var peyaMap = {};  // PeYa: externalId -> { shortCode, state, ts }. Recordamos cada pedido y su ultimo estado.
   function log(){ try{ console.log.apply(console, ['[Faltantes]'].concat([].slice.call(arguments))); }catch(e){} }
 
   // --- Distintivo visible en la esquina (para saber que esta corriendo sin abrir DevTools) ---
@@ -67,8 +68,22 @@
         for (var i = 0; i < data.length; i++) { var o = data[i]; if (o && o.id != null) cl.push(String(o.id)); }
         registrar(cl);
       } else if (/deliveries-win/i.test(url)) {
-        var arr = JSON.parse(texto); if (!Array.isArray(arr)) return; var c2 = [];
-        for (var k = 0; k < arr.length; k++) { var p = arr[k]; if (!p) continue; if (PEYA_FUERA.test(String(p.state || ''))) continue; if (p.externalId != null) c2.push(String(p.externalId)); if (p.shortCode != null) c2.push(String(p.shortCode)); }
+        // PeYa hace varias llamadas con filtros distintos (por pestana). No podemos confiar en que
+        // una sola respuesta traiga TODOS. Por eso acumulamos por pedido y solo lo damos de baja
+        // cuando vemos su estado FINAL (entregado/cancelado), nunca porque falte en una respuesta.
+        var arr = JSON.parse(texto); if (!Array.isArray(arr)) return;
+        var ahora = Date.now();
+        for (var k = 0; k < arr.length; k++) {
+          var p = arr[k]; if (!p || p.externalId == null) continue;
+          peyaMap[String(p.externalId)] = { shortCode: (p.shortCode != null ? String(p.shortCode) : null), state: String(p.state || ''), ts: ahora };
+        }
+        for (var idp in peyaMap) { if (ahora - peyaMap[idp].ts > 7200000) delete peyaMap[idp]; } // respaldo: purga >2h
+        var c2 = [];
+        for (var id2 in peyaMap) {
+          var e = peyaMap[id2];
+          if (PEYA_FUERA.test(e.state)) continue;   // entregado/cancelado => ya salio del aplicativo
+          c2.push(id2); if (e.shortCode) c2.push(e.shortCode);
+        }
         registrar(c2);
       }
     } catch (e) { log('no se pudo leer respuesta', e); }
