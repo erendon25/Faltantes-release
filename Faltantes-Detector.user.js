@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Faltantes - Detector de entregas (Rappi / PedidosYa)
 // @namespace    faltantes-delivery
-// @version      1.1.2
+// @version      1.1.3
 // @description  Lee que pedidos siguen activos en las paginas de Rappi y PedidosYa y le avisa a Faltantes para retirar solos los ya entregados.
 // @author       Erick R.
 // @match        https://aliados.rappi.com/*
@@ -15,10 +15,6 @@
 (function () {
   'use strict';
   var PUENTE = 'http://localhost:8787/api/activos';
-  // PeYa: solo estados FINALES (ya salio del aplicativo). NO incluye "listo"/preparado ni "en camino":
-  // el pedido sigue en la plataforma hasta que se ENTREGA (o se cancela), y solo ahi se retira de Faltantes.
-  var PEYA_FUERA = /CANCEL|DELIVER|CLOSED|REJECT|VOID|EXPIRE/i;
-
   var host = (location.host || '');
   var PLATAFORMA = /rappi/i.test(host) ? 'Rappi' : (/restaurant-partners/i.test(host) ? 'PedidosYa' : '');
   var ultimaFirma = null, ultimasClaves = [];
@@ -77,11 +73,11 @@
           var p = arr[k]; if (!p || p.externalId == null) continue;
           peyaMap[String(p.externalId)] = { shortCode: (p.shortCode != null ? String(p.shortCode) : null), state: String(p.state || ''), ts: ahora };
         }
-        for (var idp in peyaMap) { if (ahora - peyaMap[idp].ts > 7200000) delete peyaMap[idp]; } // respaldo: purga >2h
+        for (var idp in peyaMap) { if (ahora - peyaMap[idp].ts > 2700000) delete peyaMap[idp]; } // respaldo: purga >45 min
         var c2 = [];
         for (var id2 in peyaMap) {
           var e = peyaMap[id2];
-          if (PEYA_FUERA.test(e.state)) continue;   // entregado/cancelado => ya salio del aplicativo
+          if (e.state !== 'ACCEPTED') continue;   // activo SOLO mientras siga ACCEPTED (incluye "listo"); cualquier otro estado = ya salio
           c2.push(id2); if (e.shortCode) c2.push(e.shortCode);
         }
         registrar(c2);
@@ -109,7 +105,15 @@
     XMLHttpRequest.prototype.open = function (m, u) { this.__faltUrl = u; return _open.apply(this, arguments); };
     XMLHttpRequest.prototype.send = function () {
       var self = this;
-      this.addEventListener('load', function () { try { if (/orders-live|deliveries-win/i.test(self.__faltUrl || '')) procesar(self.__faltUrl, self.responseText); } catch (e) {} });
+      this.addEventListener('load', function () {
+        try {
+          if (!/orders-live|deliveries-win/i.test(self.__faltUrl || '')) return;
+          var cuerpo = null;
+          try { cuerpo = self.responseText; } catch (e) { cuerpo = null; } // responseText no existe si responseType='json'
+          if (!cuerpo && self.response != null) { cuerpo = (typeof self.response === 'string') ? self.response : JSON.stringify(self.response); }
+          if (cuerpo) procesar(self.__faltUrl, cuerpo);
+        } catch (e) {}
+      });
       return _send.apply(this, arguments);
     };
   } catch (e) {}
