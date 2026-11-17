@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Faltantes - Detector de entregas (Rappi / PedidosYa)
 // @namespace    faltantes-delivery
-// @version      1.2.4
+// @version      1.2.5
 // @description  Lee que pedidos siguen activos en Rappi y PedidosYa y le avisa a Faltantes para retirar solos los ya entregados.
 // @author       Erick R.
 // @match        https://aliados.rappi.com/*
@@ -41,12 +41,12 @@
     }catch(e){}
   }
 
-  function enviar(claves) {
+  function enviar(claves, entregados) {
     if (!PLATAFORMA) return;
     try {
       GM_xmlhttpRequest({
         method: 'POST', url: PUENTE, headers: { 'Content-Type': 'application/json' },
-        data: JSON.stringify({ platform: PLATAFORMA, keys: claves }), timeout: 4000,
+        data: JSON.stringify({ platform: PLATAFORMA, keys: claves, handedKeys: entregados }), timeout: 4000,
         onload: function (r) {
           var ok = false;
           try { ok = r.status >= 200 && r.status < 300 && JSON.parse(r.responseText).ok === true; } catch (e) {}
@@ -57,20 +57,20 @@
       });
     } catch (e) { badgeTxt('error (Tampermonkey)', '#b3402a'); }
   }
-  function registrar(claves) {
-    var firma = JSON.stringify(claves.slice().sort());
+  function registrar(claves, entregados) {
+    var firma = JSON.stringify([claves.slice().sort(), entregados.slice().sort()]);
     if (ultimaFirma !== firma) log('activos', PLATAFORMA, '=', claves.length, claves);
     ultimaFirma = firma;
     // Cada lectura real renueva la senal y reintenta si el puente estaba desconectado.
     // Nunca renovar con datos guardados: conexion al puente no equivale a lectura fresca.
-    enviar(claves);
+    enviar(claves, entregados);
   }
 
   // ---- Calcular el set de ACTIVOS desde una respuesta ----
-  // Rappi: activo = sigue en orders-live (cualquier estado). Si no aparece => ya salio.
-  // PeYa: activo = aparece con estado ACCEPTED. Entregado => desaparece de la lista. Cancelado => aparece con otro estado.
-  // Devuelve la lista de pedidos ACTIVOS como [{pk, keys}], o null si no se pudo leer la respuesta.
-  // Rappi: activo = aparece en orders-live. PeYa: aparece y NO esta cancelado (entregado = desaparece de la lista).
+  // Rappi conserva pedidos on_the_route en orders-live aunque ya salieron del local.
+  // Se informan como entregados al repartidor, aunque no se los haya visto antes activos.
+  // Los estados desconocidos se conservan como activos para no retirar pedidos por error.
+  // Devuelve [{pk, keys, handed?}], o null si no se pudo leer la respuesta.
   function calcular(texto) {
     try {
       if (PLATAFORMA === 'Rappi') {
@@ -78,7 +78,8 @@
         if (!Array.isArray(data)) return null;
         for (var i = 0; i < data.length; i++) {
           var o = data[i]; if (!o || o.id == null || !String(o.id).trim()) return null;
-          var id = String(o.id); out.push({ pk: id, keys: [id] });
+          var id = String(o.id);
+          out.push({ pk: id, keys: [id], handed: String(o.state || '').trim().toLowerCase() === 'on_the_route' });
         }
         return out;
       } else {
@@ -118,12 +119,20 @@
     var activos = calcular(texto);
     if (activos === null) return; // respuesta ilegible: no tocar nada
     ultimaLectura = lectura;
-    var presentes = {};
-    for (var i = 0; i < activos.length; i++) { var a = activos[i]; track[a.pk] = { keys: a.keys, misses: 0 }; presentes[a.pk] = true; }
+    var presentes = {}, entregados = [];
+    for (var i = 0; i < activos.length; i++) {
+      var a = activos[i];
+      if (a.handed) {
+        delete track[a.pk];
+        entregados = entregados.concat(a.keys);
+      } else {
+        track[a.pk] = { keys: a.keys, misses: 0 }; presentes[a.pk] = true;
+      }
+    }
     for (var pk in track) { if (Object.prototype.hasOwnProperty.call(track, pk) && !presentes[pk]) { track[pk].misses++; if (track[pk].misses > 8) delete track[pk]; } }
     var send = [];
     for (var pk2 in track) { if (Object.prototype.hasOwnProperty.call(track, pk2) && track[pk2].misses < UMBRAL) { var ks = track[pk2].keys; for (var j = 0; j < ks.length; j++) send.push(ks[j]); } }
-    registrar(send);
+    registrar(send, entregados);
   }
 
   // ---- Interceptar fetch (captura plantilla + procesa) ----
