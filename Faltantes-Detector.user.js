@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Faltantes - Detector de entregas (Rappi / PedidosYa)
 // @namespace    faltantes-delivery
-// @version      1.2.6
+// @version      1.2.7
 // @description  Lee que pedidos siguen activos en Rappi y PedidosYa y le avisa a Faltantes para retirar solos los ya entregados.
 // @author       Erick R.
 // @match        https://aliados.rappi.com/*
@@ -17,7 +17,7 @@
 // ==/UserScript==
 (function () {
   'use strict';
-  var VERSION = '1.2.6';
+  var VERSION = '1.2.7';
   var PUENTE = 'http://localhost:8787/api/activos';
   var host = (location.host || '');
   var PLATAFORMA = /rappi/i.test(host) ? 'Rappi' : (/restaurant-partners/i.test(host) ? 'PedidosYa' : '');
@@ -26,6 +26,7 @@
   var secuencia = 0, ultimaLectura = 0, consultando = false;
   var tpl = null;        // plantilla para re-consultar: { url, headers, fromVal }
   var track = {};        // pk -> { keys:[...], misses:N }. Un pedido se quita solo si falta en varias lecturas seguidas.
+  var terminados = {}, consultasDetalle = 0;
   var UMBRAL = 2;        // lecturas seguidas sin aparecer antes de darlo por salido (evita borrar por 1 lectura mala)
   function log(){ try{ console.log.apply(console, ['[Faltantes]'].concat([].slice.call(arguments))); }catch(e){} }
 
@@ -42,29 +43,36 @@
     }catch(e){}
   }
 
-  function enviar(claves, entregados) {
+  function enviar(claves, entregados, cancelados, cantidad) {
     if (!PLATAFORMA) return;
     try {
       GM_xmlhttpRequest({
         method: 'POST', url: PUENTE, headers: { 'Content-Type': 'application/json' },
-        data: JSON.stringify({ platform: PLATAFORMA, keys: claves, handedKeys: entregados }), timeout: 4000,
+        data: JSON.stringify({ platform: PLATAFORMA, keys: claves, handedKeys: entregados, cancelledKeys: cancelados }), timeout: 4000,
         onload: function (r) {
           var ok = false;
           try { ok = r.status >= 200 && r.status < 300 && JSON.parse(r.responseText).ok === true; } catch (e) {}
-          badgeTxt(ok ? 'conectado (' + claves.length + ' activos)' : 'el puente no acepto la lectura', ok ? '#2f7d4f' : '#b3402a');
+          badgeTxt(ok ? 'conectado (' + cantidad + ' activos)' : 'el puente no acepto la lectura', ok ? '#2f7d4f' : '#b3402a');
         },
         onerror: function () { badgeTxt('no encuentra el puente', '#b3402a'); },
         ontimeout: function () { badgeTxt('sin respuesta del puente', '#b3402a'); }
       });
     } catch (e) { badgeTxt('error (Tampermonkey)', '#b3402a'); }
   }
-  function registrar(claves, entregados) {
-    var firma = JSON.stringify([claves.slice().sort(), entregados.slice().sort()]);
+  function registrar(claves, entregados, cancelados, cantidad) {
+    var firma = JSON.stringify([claves.slice().sort(), entregados.slice().sort(), cancelados.slice().sort()]);
     if (ultimaFirma !== firma) log('activos', PLATAFORMA, '=', claves.length, claves);
     ultimaFirma = firma;
     // Cada lectura real renueva la senal y reintenta si el puente estaba desconectado.
     // Nunca renovar con datos guardados: conexion al puente no equivale a lectura fresca.
-    enviar(claves, entregados);
+    enviar(claves, entregados, cancelados, cantidad);
+  }
+
+  function estadoPeYa(p) {
+    var estado = String(p.state || '').trim().toUpperCase();
+    if (estado === 'PICKED_UP' || estado === 'CLOSED') return 'handed';
+    if (/^(CANCELLED(_BY_PLATFORM|_BY_TRANSPORT)?|REJECTED|EXPIRED|MISSED)$/.test(estado)) return 'cancelled';
+    return 'open';
   }
 
   // ---- Calcular el set de ACTIVOS desde una respuesta ----
@@ -88,9 +96,9 @@
         var arr = JSON.parse(texto); if (!Array.isArray(arr)) return null; var out2 = [];
         for (var k = 0; k < arr.length; k++) {
           var p = arr[k]; if (!p || p.externalId == null || !String(p.externalId).trim()) return null;
-          if (/CANCEL|REJECT|VOID|EXPIR/i.test(String(p.state || ''))) continue; // cancelado = ya no activo
           var pk = String(p.externalId); var keys = [pk]; if (p.shortCode != null) keys.push(String(p.shortCode));
-          out2.push({ pk: pk, keys: keys });
+          var estado = estadoPeYa(p);
+          out2.push({ pk: pk, keys: keys, detailId: p.id == null ? '' : String(p.id), handed: estado === 'handed', cancelled: estado === 'cancelled' });
         }
         return out2;
       }
@@ -127,20 +135,68 @@
     var activos = calcular(texto);
     if (activos === null) return; // respuesta ilegible: no tocar nada
     ultimaLectura = lectura;
-    var presentes = {}, entregados = [];
+    var presentes = {};
     for (var i = 0; i < activos.length; i++) {
       var a = activos[i];
-      if (a.handed) {
+      if (a.handed || a.cancelled) {
         delete track[a.pk];
-        entregados = entregados.concat(a.keys);
+        terminados[a.pk] = { keys: a.keys, kind: a.handed ? 'handed' : 'cancelled' };
       } else {
-        track[a.pk] = { keys: a.keys, misses: 0 }; presentes[a.pk] = true;
+        delete terminados[a.pk];
+        track[a.pk] = { keys: a.keys, detailId: a.detailId, misses: 0 }; presentes[a.pk] = true;
       }
     }
-    for (var pk in track) { if (Object.prototype.hasOwnProperty.call(track, pk) && !presentes[pk]) { track[pk].misses++; if (track[pk].misses > 8) delete track[pk]; } }
-    var send = [];
-    for (var pk2 in track) { if (Object.prototype.hasOwnProperty.call(track, pk2) && track[pk2].misses < UMBRAL) { var ks = track[pk2].keys; for (var j = 0; j < ks.length; j++) send.push(ks[j]); } }
-    registrar(send, entregados);
+    for (var pk in track) { if (Object.prototype.hasOwnProperty.call(track, pk) && !presentes[pk]) { track[pk].misses++; if (PLATAFORMA !== 'PedidosYa' && track[pk].misses > 8) delete track[pk]; } }
+    emitirSeguimiento();
+    if (PLATAFORMA === 'PedidosYa') {
+      for (var pendiente in track) if (Object.prototype.hasOwnProperty.call(track, pendiente) && track[pendiente].misses >= UMBRAL) confirmarDetalle(pendiente);
+    }
+  }
+
+  function emitirSeguimiento() {
+    var send = [], entregados = [], cancelados = [], cantidad = 0;
+    for (var pk in track) {
+      if (!Object.prototype.hasOwnProperty.call(track, pk)) continue;
+      // En PeYa una ausencia no prueba entrega: mantenerlo hasta consultar el detalle.
+      if (PLATAFORMA !== 'PedidosYa' && track[pk].misses >= UMBRAL) continue;
+      send = send.concat(track[pk].keys); cantidad++;
+    }
+    for (var terminado in terminados) {
+      if (!Object.prototype.hasOwnProperty.call(terminados, terminado)) continue;
+      var t = terminados[terminado];
+      // Confirmar por ID externo completo: el numero corto puede reutilizarse otro dia.
+      if (t.kind === 'handed') entregados.push(terminado);
+      else cancelados.push(terminado);
+    }
+    registrar(send, entregados, cancelados, cantidad);
+  }
+
+  // PedidosYa tambien verifica /1/deliveries/{id} cuando falta un pedido en deliveries-win.
+  // Un 404, error, respuesta incompleta o ACCEPTED conserva el pedido; nunca infiere entrega.
+  function confirmarDetalle(pk) {
+    var pedido = track[pk], base = tpl && String(tpl.url).match(/^(.*)\/2\/deliveries-win(?:[?#]|$)/i);
+    if (!pedido || !pedido.detailId || !base || pedido.checking || consultasDetalle >= 2 || (pedido.retryAt || 0) > Date.now()) return;
+    pedido.checking = true; consultasDetalle++;
+    function finalizar() { pedido.checking = false; pedido.retryAt = Date.now() + 10000; consultasDetalle--; }
+    try {
+      GM_xmlhttpRequest({
+        method: 'GET', url: base[1] + '/1/deliveries/' + encodeURIComponent(pedido.detailId),
+        headers: limpiarHeaders(tpl.headers), timeout: 7000,
+        onload: function (r) {
+          finalizar();
+          if (track[pk] !== pedido || r.status < 200 || r.status >= 300) return;
+          try {
+            var p = JSON.parse(r.responseText);
+            if (!p || String(p.id) !== pedido.detailId || String(p.externalId) !== pk) return;
+            var estado = estadoPeYa(p);
+            if (estado === 'open') return;
+            delete track[pk]; terminados[pk] = { keys: pedido.keys, kind: estado };
+            emitirSeguimiento();
+          } catch (e) {}
+        },
+        onerror: finalizar, ontimeout: finalizar
+      });
+    } catch (e) { finalizar(); }
   }
 
   // ---- Interceptar fetch (captura plantilla + procesa) ----
