@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Faltantes - Detector de entregas (Rappi / PedidosYa)
 // @namespace    faltantes-delivery
-// @version      1.2.1
+// @version      1.2.2
 // @description  Lee que pedidos siguen activos en Rappi y PedidosYa y le avisa a Faltantes para retirar solos los ya entregados.
 // @author       Erick R.
 // @match        https://aliados.rappi.com/*
@@ -143,16 +143,22 @@
   function reconsultar() {
     if (!tpl || !tpl.url) { log('re-consulta: aun sin plantilla'); return; }
     try {
+      var esGet = String(tpl.metodo || 'GET').toUpperCase() === 'GET';
+      var url = tpl.url;
+      if (esGet) url += (url.indexOf('?') >= 0 ? '&' : '?') + '__fcb=' + Date.now(); // rompe cache: trae la lista fresca
+      var cab = {}; for (var k in (tpl.headers || {})) { if (Object.prototype.hasOwnProperty.call(tpl.headers, k)) cab[k] = tpl.headers[k]; }
+      cab['Cache-Control'] = 'no-cache'; cab['Pragma'] = 'no-cache';
       var opt = {
-        method: tpl.metodo || 'GET', url: tpl.url, headers: tpl.headers || {}, timeout: 7000,
+        method: tpl.metodo || 'GET', url: url, headers: cab, timeout: 7000,
         onload: function (r) {
-          log('re-consulta', PLATAFORMA, 'HTTP', r.status, 'len', (r.responseText || '').length);
-          try { if (r.status >= 200 && r.status < 300 && r.responseText) procesarAutoritativa(tpl.url, r.responseText); } catch (e) { log('re-consulta parse err', e); }
+          var t = r.responseText || '';
+          log('re-consulta', PLATAFORMA, 'HTTP', r.status, 'len', t.length, '|', t.slice(0, 180));
+          try { if (r.status >= 200 && r.status < 300 && t) procesarAutoritativa(tpl.url, t); } catch (e) { log('re-consulta parse err', e); }
         },
         onerror: function (e) { log('re-consulta ERROR', PLATAFORMA, (e && (e.error || e.statusText)) || ''); },
         ontimeout: function () { log('re-consulta TIMEOUT', PLATAFORMA); }
       };
-      if (tpl.body != null && String(tpl.metodo || 'GET').toUpperCase() !== 'GET') opt.data = tpl.body;
+      if (!esGet && tpl.body != null) opt.data = tpl.body;
       GM_xmlhttpRequest(opt);
     } catch (e) { log('re-consulta excepcion', e); }
   }
