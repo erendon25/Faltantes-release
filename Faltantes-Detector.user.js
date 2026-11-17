@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Faltantes - Detector de entregas (Rappi / PedidosYa)
 // @namespace    faltantes-delivery
-// @version      1.2.0
+// @version      1.2.1
 // @description  Lee que pedidos siguen activos en Rappi y PedidosYa y le avisa a Faltantes para retirar solos los ya entregados.
 // @author       Erick R.
 // @match        https://aliados.rappi.com/*
@@ -82,14 +82,15 @@
   function limpiarHeaders(h){ var out = {}; if (!h) return out; var mal = /^(host|content-length|origin|referer|user-agent|cookie|connection|accept-encoding)$/i; for (var k in h){ if (Object.prototype.hasOwnProperty.call(h, k) && !mal.test(k)) out[k] = h[k]; } return out; }
 
   // Guarda/actualiza la plantilla de re-consulta. Para PeYa conserva la de ventana mas amplia (from mas antiguo).
-  function guardarPlantilla(url, headers) {
+  function guardarPlantilla(url, headers, metodo, body) {
     var fromVal = getFrom(url);
     var limpias = limpiarHeaders(headers);
+    var m = metodo || 'GET'; var b = (body != null ? body : null);
     if (PLATAFORMA === 'PedidosYa') {
-      if (!tpl || (fromVal && (!tpl.fromVal || fromVal < tpl.fromVal))) { tpl = { url: url, headers: limpias, fromVal: fromVal }; }
-      else if (tpl && getFrom(url) === tpl.fromVal) { tpl.headers = limpias; tpl.url = url; }
+      if (!tpl || (fromVal && (!tpl.fromVal || fromVal < tpl.fromVal))) { tpl = { url: url, headers: limpias, fromVal: fromVal, metodo: m, body: b }; }
+      else if (tpl && getFrom(url) === tpl.fromVal) { tpl.headers = limpias; tpl.url = url; tpl.metodo = m; tpl.body = b; }
     } else {
-      tpl = { url: url, headers: limpias, fromVal: fromVal };
+      tpl = { url: url, headers: limpias, fromVal: fromVal, metodo: m, body: b };
     }
   }
   // Procesa una respuesta como AUTORITATIVA (solo la llamada mas amplia en PeYa).
@@ -107,8 +108,10 @@
         var args = arguments, url = ('' + (args[0] && args[0].url ? args[0].url : args[0]));
         var hdrs = {};
         try { var hi = (args[1] && args[1].headers) || (args[0] && args[0].headers); if (hi) { if (hi.forEach) hi.forEach(function(v,k){ hdrs[k]=v; }); else Object.keys(hi).forEach(function(k){ hdrs[k]=hi[k]; }); } } catch(e){}
+        var metodo = (args[1] && args[1].method) || (args[0] && args[0].method) || 'GET';
+        var body = (args[1] && args[1].body) || null;
         return _fetch.apply(this, args).then(function (r) {
-          try { var u = (r && r.url) || url; if (coincide(u)) { guardarPlantilla(u, hdrs); r.clone().text().then(function (t) { procesarAutoritativa(u, t); }).catch(function(){}); } } catch (e) {}
+          try { var u = (r && r.url) || url; if (coincide(u)) { guardarPlantilla(u, hdrs, metodo, body); r.clone().text().then(function (t) { procesarAutoritativa(u, t); }).catch(function(){}); } } catch (e) {}
           return r;
         });
       };
@@ -118,14 +121,14 @@
   // ---- Interceptar XMLHttpRequest (captura cabeceras + procesa) ----
   try {
     var _open = XMLHttpRequest.prototype.open, _setH = XMLHttpRequest.prototype.setRequestHeader, _send = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open = function (m, u) { this.__u = u; this.__h = {}; return _open.apply(this, arguments); };
+    XMLHttpRequest.prototype.open = function (m, u) { this.__u = u; this.__m = m; this.__h = {}; return _open.apply(this, arguments); };
     XMLHttpRequest.prototype.setRequestHeader = function (k, v) { try { this.__h[k] = v; } catch(e){} return _setH.apply(this, arguments); };
-    XMLHttpRequest.prototype.send = function () {
-      var self = this;
+    XMLHttpRequest.prototype.send = function (body) {
+      var self = this; self.__b = body;
       this.addEventListener('load', function () {
         try {
           if (!coincide(self.__u || '')) return;
-          guardarPlantilla(self.__u, self.__h || {});
+          guardarPlantilla(self.__u, self.__h || {}, self.__m, self.__b);
           var cuerpo = null;
           try { cuerpo = self.responseText; } catch (e) { cuerpo = null; }
           if (!cuerpo && self.response != null) { cuerpo = (typeof self.response === 'string') ? self.response : JSON.stringify(self.response); }
@@ -138,14 +141,20 @@
 
   // ---- Re-consulta propia cada 12s: asegura que detectemos entregas aunque la pagina no refresque sola ----
   function reconsultar() {
-    if (!tpl || !tpl.url) return;
+    if (!tpl || !tpl.url) { log('re-consulta: aun sin plantilla'); return; }
     try {
-      GM_xmlhttpRequest({
-        method: 'GET', url: tpl.url, headers: tpl.headers || {}, timeout: 7000,
-        onload: function (r) { try { if (r.status >= 200 && r.status < 300 && r.responseText) procesarAutoritativa(tpl.url, r.responseText); } catch (e) {} },
-        onerror: function () {}, ontimeout: function () {}
-      });
-    } catch (e) {}
+      var opt = {
+        method: tpl.metodo || 'GET', url: tpl.url, headers: tpl.headers || {}, timeout: 7000,
+        onload: function (r) {
+          log('re-consulta', PLATAFORMA, 'HTTP', r.status, 'len', (r.responseText || '').length);
+          try { if (r.status >= 200 && r.status < 300 && r.responseText) procesarAutoritativa(tpl.url, r.responseText); } catch (e) { log('re-consulta parse err', e); }
+        },
+        onerror: function (e) { log('re-consulta ERROR', PLATAFORMA, (e && (e.error || e.statusText)) || ''); },
+        ontimeout: function () { log('re-consulta TIMEOUT', PLATAFORMA); }
+      };
+      if (tpl.body != null && String(tpl.metodo || 'GET').toUpperCase() !== 'GET') opt.data = tpl.body;
+      GM_xmlhttpRequest(opt);
+    } catch (e) { log('re-consulta excepcion', e); }
   }
 
   function iniciar() {
