@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Faltantes - Detector de entregas (Rappi / PedidosYa)
 // @namespace    faltantes-delivery
-// @version      1.2.3
+// @version      1.2.4
 // @description  Lee que pedidos siguen activos en Rappi y PedidosYa y le avisa a Faltantes para retirar solos los ya entregados.
 // @author       Erick R.
 // @match        https://aliados.rappi.com/*
@@ -21,7 +21,8 @@
   var host = (location.host || '');
   var PLATAFORMA = /rappi/i.test(host) ? 'Rappi' : (/restaurant-partners/i.test(host) ? 'PedidosYa' : '');
 
-  var ultimaFirma = null, ultimasClaves = [];
+  var ultimaFirma = null;
+  var secuencia = 0, ultimaLectura = 0, consultando = false;
   var tpl = null;        // plantilla para re-consultar: { url, headers, fromVal }
   var track = {};        // pk -> { keys:[...], misses:N }. Un pedido se quita solo si falta en varias lecturas seguidas.
   var UMBRAL = 2;        // lecturas seguidas sin aparecer antes de darlo por salido (evita borrar por 1 lectura mala)
@@ -46,18 +47,22 @@
       GM_xmlhttpRequest({
         method: 'POST', url: PUENTE, headers: { 'Content-Type': 'application/json' },
         data: JSON.stringify({ platform: PLATAFORMA, keys: claves }), timeout: 4000,
-        onload: function () { badgeTxt('conectado (' + claves.length + ' activos)', '#2f7d4f'); },
+        onload: function (r) {
+          var ok = false;
+          try { ok = r.status >= 200 && r.status < 300 && JSON.parse(r.responseText).ok === true; } catch (e) {}
+          badgeTxt(ok ? 'conectado (' + claves.length + ' activos)' : 'el puente no acepto la lectura', ok ? '#2f7d4f' : '#b3402a');
+        },
         onerror: function () { badgeTxt('no encuentra el puente', '#b3402a'); },
         ontimeout: function () { badgeTxt('sin respuesta del puente', '#b3402a'); }
       });
     } catch (e) { badgeTxt('error (Tampermonkey)', '#b3402a'); }
   }
   function registrar(claves) {
-    ultimasClaves = claves;
     var firma = JSON.stringify(claves.slice().sort());
-    if (ultimaFirma === firma) return;
+    if (ultimaFirma !== firma) log('activos', PLATAFORMA, '=', claves.length, claves);
     ultimaFirma = firma;
-    log('activos', PLATAFORMA, '=', claves.length, claves);
+    // Cada lectura real renueva la senal y reintenta si el puente estaba desconectado.
+    // Nunca renovar con datos guardados: conexion al puente no equivale a lectura fresca.
     enviar(claves);
   }
 
@@ -69,13 +74,17 @@
   function calcular(texto) {
     try {
       if (PLATAFORMA === 'Rappi') {
-        var j = JSON.parse(texto); var data = (j && j.data) || []; var out = [];
-        for (var i = 0; i < data.length; i++) { var o = data[i]; if (o && o.id != null) { var id = String(o.id); out.push({ pk: id, keys: [id] }); } }
+        var j = JSON.parse(texto); var data = j && j.data; var out = [];
+        if (!Array.isArray(data)) return null;
+        for (var i = 0; i < data.length; i++) {
+          var o = data[i]; if (!o || o.id == null || !String(o.id).trim()) return null;
+          var id = String(o.id); out.push({ pk: id, keys: [id] });
+        }
         return out;
       } else {
         var arr = JSON.parse(texto); if (!Array.isArray(arr)) return null; var out2 = [];
         for (var k = 0; k < arr.length; k++) {
-          var p = arr[k]; if (!p || p.externalId == null) continue;
+          var p = arr[k]; if (!p || p.externalId == null || !String(p.externalId).trim()) return null;
           if (/CANCEL|REJECT|VOID|EXPIR/i.test(String(p.state || ''))) continue; // cancelado = ya no activo
           var pk = String(p.externalId); var keys = [pk]; if (p.shortCode != null) keys.push(String(p.shortCode));
           out2.push({ pk: pk, keys: keys });
@@ -103,10 +112,12 @@
     }
   }
   // Procesa una respuesta como AUTORITATIVA (solo la llamada mas amplia en PeYa).
-  function procesarAutoritativa(url, texto) {
+  function procesarAutoritativa(url, texto, lectura) {
     if (PLATAFORMA === 'PedidosYa' && tpl && getFrom(url) !== tpl.fromVal) return; // ignora llamadas filtradas (subconjuntos)
+    if (lectura <= ultimaLectura) return; // una respuesta vieja no pisa una mas reciente
     var activos = calcular(texto);
     if (activos === null) return; // respuesta ilegible: no tocar nada
+    ultimaLectura = lectura;
     var presentes = {};
     for (var i = 0; i < activos.length; i++) { var a = activos[i]; track[a.pk] = { keys: a.keys, misses: 0 }; presentes[a.pk] = true; }
     for (var pk in track) { if (Object.prototype.hasOwnProperty.call(track, pk) && !presentes[pk]) { track[pk].misses++; if (track[pk].misses > 8) delete track[pk]; } }
@@ -125,8 +136,9 @@
         try { var hi = (args[1] && args[1].headers) || (args[0] && args[0].headers); if (hi) { if (hi.forEach) hi.forEach(function(v,k){ hdrs[k]=v; }); else Object.keys(hi).forEach(function(k){ hdrs[k]=hi[k]; }); } } catch(e){}
         var metodo = (args[1] && args[1].method) || (args[0] && args[0].method) || 'GET';
         var body = (args[1] && args[1].body) || null;
+        var lectura = ++secuencia;
         return _fetch.apply(this, args).then(function (r) {
-          try { var u = (r && r.url) || url; if (coincide(u)) { guardarPlantilla(u, hdrs, metodo, body); r.clone().text().then(function (t) { procesarAutoritativa(u, t); }).catch(function(){}); } } catch (e) {}
+          try { var u = (r && r.url) || url; if (r.status >= 200 && r.status < 300 && coincide(u)) { guardarPlantilla(u, hdrs, metodo, body); r.clone().text().then(function (t) { procesarAutoritativa(u, t, lectura); }).catch(function(){}); } } catch (e) {}
           return r;
         });
       };
@@ -140,24 +152,28 @@
     XMLHttpRequest.prototype.setRequestHeader = function (k, v) { try { this.__h[k] = v; } catch(e){} return _setH.apply(this, arguments); };
     XMLHttpRequest.prototype.send = function (body) {
       var self = this; self.__b = body;
+      var lectura = ++secuencia;
       this.addEventListener('load', function () {
         try {
-          if (!coincide(self.__u || '')) return;
+          if (self.status < 200 || self.status >= 300 || !coincide(self.__u || '')) return;
           guardarPlantilla(self.__u, self.__h || {}, self.__m, self.__b);
           var cuerpo = null;
           try { cuerpo = self.responseText; } catch (e) { cuerpo = null; }
           if (!cuerpo && self.response != null) { cuerpo = (typeof self.response === 'string') ? self.response : JSON.stringify(self.response); }
-          if (cuerpo) procesarAutoritativa(self.__u, cuerpo);
+          if (cuerpo) procesarAutoritativa(self.__u, cuerpo, lectura);
         } catch (e) {}
       });
       return _send.apply(this, arguments);
     };
   } catch (e) {}
 
-  // ---- Re-consulta propia cada 12s: asegura que detectemos entregas aunque la pagina no refresque sola ----
+  // ---- Re-consulta propia cada 5s: dos ausencias confirmadas sin recargar la pagina ----
   function reconsultar() {
+    if (consultando) return;
     if (!tpl || !tpl.url) { log('re-consulta: aun sin plantilla'); return; }
+    consultando = true;
     try {
+      var lectura = ++secuencia, urlOrigen = tpl.url;
       var esGet = String(tpl.metodo || 'GET').toUpperCase() === 'GET';
       var url = tpl.url;
       if (esGet) url += (url.indexOf('?') >= 0 ? '&' : '?') + '__fcb=' + Date.now(); // rompe cache: trae la lista fresca
@@ -166,24 +182,25 @@
       var opt = {
         method: tpl.metodo || 'GET', url: url, headers: cab, timeout: 7000,
         onload: function (r) {
+          consultando = false;
           var t = r.responseText || '';
           log('re-consulta', PLATAFORMA, 'HTTP', r.status, 'len', t.length);
-          try { if (r.status >= 200 && r.status < 300 && t) procesarAutoritativa(tpl.url, t); } catch (e) { log('re-consulta parse err', e); }
+          try { if (r.status >= 200 && r.status < 300 && t) procesarAutoritativa(urlOrigen, t, lectura); } catch (e) { log('re-consulta parse err', e); }
         },
-        onerror: function (e) { log('re-consulta ERROR', PLATAFORMA, (e && (e.error || e.statusText)) || ''); },
-        ontimeout: function () { log('re-consulta TIMEOUT', PLATAFORMA); }
+        onerror: function (e) { consultando = false; badgeTxt('sin lectura de ' + PLATAFORMA, '#b3402a'); log('re-consulta ERROR', PLATAFORMA, (e && (e.error || e.statusText)) || ''); },
+        ontimeout: function () { consultando = false; badgeTxt('sin lectura de ' + PLATAFORMA, '#b3402a'); log('re-consulta TIMEOUT', PLATAFORMA); }
       };
       if (!esGet && tpl.body != null) opt.data = tpl.body;
       GM_xmlhttpRequest(opt);
-    } catch (e) { log('re-consulta excepcion', e); }
+    } catch (e) { consultando = false; log('re-consulta excepcion', e); }
   }
 
   function iniciar() {
     ponerBadge();
     log('detector cargado en', PLATAFORMA || host);
-    enviar([]); // saludo: aparece en http://localhost:8787/api/activos aunque aun no haya pedidos
-    setInterval(reconsultar, 12000);
-    setInterval(function () { enviar(ultimasClaves); }, 20000); // latido: mantiene fresca la senal
+    badgeTxt('esperando lectura de ' + PLATAFORMA, '#6b746b');
+    // El inicio y los errores no son listas vacias: solo se envia tras leer la app.
+    setInterval(reconsultar, 5000);
   }
   if (document.body) iniciar();
   else document.addEventListener('DOMContentLoaded', iniciar);
