@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Faltantes - Detector de entregas (Rappi / PedidosYa)
 // @namespace    faltantes-delivery
-// @version      1.2.2
+// @version      1.2.3
 // @description  Lee que pedidos siguen activos en Rappi y PedidosYa y le avisa a Faltantes para retirar solos los ya entregados.
 // @author       Erick R.
 // @match        https://aliados.rappi.com/*
@@ -23,6 +23,8 @@
 
   var ultimaFirma = null, ultimasClaves = [];
   var tpl = null;        // plantilla para re-consultar: { url, headers, fromVal }
+  var track = {};        // pk -> { keys:[...], misses:N }. Un pedido se quita solo si falta en varias lecturas seguidas.
+  var UMBRAL = 2;        // lecturas seguidas sin aparecer antes de darlo por salido (evita borrar por 1 lectura mala)
   function log(){ try{ console.log.apply(console, ['[Faltantes]'].concat([].slice.call(arguments))); }catch(e){} }
 
   // ---- Distintivo visible ----
@@ -62,16 +64,23 @@
   // ---- Calcular el set de ACTIVOS desde una respuesta ----
   // Rappi: activo = sigue en orders-live (cualquier estado). Si no aparece => ya salio.
   // PeYa: activo = aparece con estado ACCEPTED. Entregado => desaparece de la lista. Cancelado => aparece con otro estado.
+  // Devuelve la lista de pedidos ACTIVOS como [{pk, keys}], o null si no se pudo leer la respuesta.
+  // Rappi: activo = aparece en orders-live. PeYa: aparece y NO esta cancelado (entregado = desaparece de la lista).
   function calcular(texto) {
     try {
       if (PLATAFORMA === 'Rappi') {
-        var j = JSON.parse(texto); var data = (j && j.data) || []; var cl = [];
-        for (var i = 0; i < data.length; i++) { var o = data[i]; if (o && o.id != null) cl.push(String(o.id)); }
-        return cl;
+        var j = JSON.parse(texto); var data = (j && j.data) || []; var out = [];
+        for (var i = 0; i < data.length; i++) { var o = data[i]; if (o && o.id != null) { var id = String(o.id); out.push({ pk: id, keys: [id] }); } }
+        return out;
       } else {
-        var arr = JSON.parse(texto); if (!Array.isArray(arr)) return null; var c2 = [];
-        for (var k = 0; k < arr.length; k++) { var p = arr[k]; if (!p || p.state !== 'ACCEPTED') continue; if (p.externalId != null) c2.push(String(p.externalId)); if (p.shortCode != null) c2.push(String(p.shortCode)); }
-        return c2;
+        var arr = JSON.parse(texto); if (!Array.isArray(arr)) return null; var out2 = [];
+        for (var k = 0; k < arr.length; k++) {
+          var p = arr[k]; if (!p || p.externalId == null) continue;
+          if (/CANCEL|REJECT|VOID|EXPIR/i.test(String(p.state || ''))) continue; // cancelado = ya no activo
+          var pk = String(p.externalId); var keys = [pk]; if (p.shortCode != null) keys.push(String(p.shortCode));
+          out2.push({ pk: pk, keys: keys });
+        }
+        return out2;
       }
     } catch (e) { return null; }
   }
@@ -96,8 +105,14 @@
   // Procesa una respuesta como AUTORITATIVA (solo la llamada mas amplia en PeYa).
   function procesarAutoritativa(url, texto) {
     if (PLATAFORMA === 'PedidosYa' && tpl && getFrom(url) !== tpl.fromVal) return; // ignora llamadas filtradas (subconjuntos)
-    var claves = calcular(texto);
-    if (claves !== null) registrar(claves);
+    var activos = calcular(texto);
+    if (activos === null) return; // respuesta ilegible: no tocar nada
+    var presentes = {};
+    for (var i = 0; i < activos.length; i++) { var a = activos[i]; track[a.pk] = { keys: a.keys, misses: 0 }; presentes[a.pk] = true; }
+    for (var pk in track) { if (Object.prototype.hasOwnProperty.call(track, pk) && !presentes[pk]) { track[pk].misses++; if (track[pk].misses > 8) delete track[pk]; } }
+    var send = [];
+    for (var pk2 in track) { if (Object.prototype.hasOwnProperty.call(track, pk2) && track[pk2].misses < UMBRAL) { var ks = track[pk2].keys; for (var j = 0; j < ks.length; j++) send.push(ks[j]); } }
+    registrar(send);
   }
 
   // ---- Interceptar fetch (captura plantilla + procesa) ----
@@ -152,7 +167,7 @@
         method: tpl.metodo || 'GET', url: url, headers: cab, timeout: 7000,
         onload: function (r) {
           var t = r.responseText || '';
-          log('re-consulta', PLATAFORMA, 'HTTP', r.status, 'len', t.length, '|', t.slice(0, 180));
+          log('re-consulta', PLATAFORMA, 'HTTP', r.status, 'len', t.length);
           try { if (r.status >= 200 && r.status < 300 && t) procesarAutoritativa(tpl.url, t); } catch (e) { log('re-consulta parse err', e); }
         },
         onerror: function (e) { log('re-consulta ERROR', PLATAFORMA, (e && (e.error || e.statusText)) || ''); },
