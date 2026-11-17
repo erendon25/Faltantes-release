@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Faltantes - Detector de entregas (Rappi / PedidosYa)
 // @namespace    faltantes-delivery
-// @version      1.2.5
+// @version      1.2.6
 // @description  Lee que pedidos siguen activos en Rappi y PedidosYa y le avisa a Faltantes para retirar solos los ya entregados.
 // @author       Erick R.
 // @match        https://aliados.rappi.com/*
@@ -17,6 +17,7 @@
 // ==/UserScript==
 (function () {
   'use strict';
+  var VERSION = '1.2.6';
   var PUENTE = 'http://localhost:8787/api/activos';
   var host = (location.host || '');
   var PLATAFORMA = /rappi/i.test(host) ? 'Rappi' : (/restaurant-partners/i.test(host) ? 'PedidosYa' : '');
@@ -30,7 +31,7 @@
 
   // ---- Distintivo visible ----
   var badge;
-  function badgeTxt(t, color){ try{ if(badge){ badge.textContent = 'Faltantes: ' + t; badge.style.background = color; } }catch(e){} }
+  function badgeTxt(t, color){ try{ if(badge){ badge.textContent = 'Faltantes v' + VERSION + ': ' + t; badge.style.background = color; } }catch(e){} }
   function ponerBadge(){
     try{
       if (badge || !document.body) return;
@@ -67,19 +68,20 @@
   }
 
   // ---- Calcular el set de ACTIVOS desde una respuesta ----
-  // Rappi conserva pedidos on_the_route en orders-live aunque ya salieron del local.
-  // Se informan como entregados al repartidor, aunque no se los haya visto antes activos.
+  // Rappi: leer exclusivamente orders del endpoint del tablero /partner/status/v2.
+  // El campo partner_order_state es el que usa el tablero para clasificar pedidos.
+  // delivered_to_rt confirma entrega al repartidor aunque no se lo haya visto activo.
   // Los estados desconocidos se conservan como activos para no retirar pedidos por error.
   // Devuelve [{pk, keys, handed?}], o null si no se pudo leer la respuesta.
   function calcular(texto) {
     try {
       if (PLATAFORMA === 'Rappi') {
-        var j = JSON.parse(texto); var data = j && j.data; var out = [];
+        var j = JSON.parse(texto); var data = j && j.orders; var out = [];
         if (!Array.isArray(data)) return null;
         for (var i = 0; i < data.length; i++) {
           var o = data[i]; if (!o || o.id == null || !String(o.id).trim()) return null;
           var id = String(o.id);
-          out.push({ pk: id, keys: [id], handed: String(o.state || '').trim().toLowerCase() === 'on_the_route' });
+          out.push({ pk: id, keys: [id], handed: String(o.partner_order_state || '').trim().toLowerCase() === 'delivered_to_rt' });
         }
         return out;
       } else {
@@ -96,7 +98,13 @@
   }
 
   function getFrom(url){ try{ var m = String(url).match(/[?&]from=([^&]+)/i); return m ? decodeURIComponent(m[1]) : ''; }catch(e){ return ''; } }
-  function coincide(url){ return /orders-live|deliveries-win/i.test(String(url)); }
+  function coincide(url){
+    var value = String(url);
+    // No aceptar coincidencias por nombre: orders-live tambien existe en soporte/chat
+    // y puede incluir pedidos de otros locales que no aparecen en el tablero.
+    if (PLATAFORMA === 'Rappi') return /^(?:https?:\/\/[^/?#]+)?\/api\/rs-aliados-gateway\/orders\/partner\/status\/v2\/?(?:[?#]|$)/i.test(value);
+    return /deliveries-win/i.test(value);
+  }
   // Quita cabeceras que el navegador maneja solo (si las forzamos, la re-consulta puede fallar).
   function limpiarHeaders(h){ var out = {}; if (!h) return out; var mal = /^(host|content-length|origin|referer|user-agent|cookie|connection|accept-encoding)$/i; for (var k in h){ if (Object.prototype.hasOwnProperty.call(h, k) && !mal.test(k)) out[k] = h[k]; } return out; }
 
