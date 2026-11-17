@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Faltantes - Detector de entregas (Rappi / PedidosYa)
 // @namespace    faltantes-delivery
-// @version      1.0.0
+// @version      1.1.0
 // @description  Lee que pedidos siguen activos en las paginas de Rappi y PedidosYa y le avisa a Faltantes para retirar solos los ya entregados.
 // @author       Erick R.
 // @match        https://aliados.rappi.com/*
@@ -15,59 +15,59 @@
 (function () {
   'use strict';
   var PUENTE = 'http://localhost:8787/api/activos';
-
-  // Estados que significan que el pedido YA salio (no cuenta como activo) en PedidosYa.
   var PEYA_FUERA = /CANCEL|DELIVER|CLOSED|PICKED|DISPATCH|COMPLET|REJECT|VOID|EXPIRE/i;
 
-  var ultimaFirma = {};   // plataforma -> firma de las claves (para no repetir envios iguales)
-  var ultimasClaves = {}; // plataforma -> ultimas claves enviadas (para el latido)
+  var host = (location.host || '');
+  var PLATAFORMA = /rappi/i.test(host) ? 'Rappi' : (/restaurant-partners/i.test(host) ? 'PedidosYa' : '');
+  var ultimaFirma = null, ultimasClaves = [];
+  function log(){ try{ console.log.apply(console, ['[Faltantes]'].concat([].slice.call(arguments))); }catch(e){} }
 
-  function enviar(plataforma, claves) {
-    try {
-      GM_xmlhttpRequest({
-        method: 'POST',
-        url: PUENTE,
-        headers: { 'Content-Type': 'application/json' },
-        data: JSON.stringify({ platform: plataforma, keys: claves }),
-        timeout: 4000,
-        onload: function () {}, onerror: function () {}, ontimeout: function () {}
-      });
-    } catch (e) {}
+  // --- Distintivo visible en la esquina (para saber que esta corriendo sin abrir DevTools) ---
+  var badge;
+  function badgeTxt(t, color){ try{ if(!badge) return; badge.textContent = 'Faltantes: ' + t; badge.style.background = color; }catch(e){} }
+  function ponerBadge(){
+    try{
+      if (badge || !document.body) return;
+      badge = document.createElement('div');
+      badge.style.cssText = 'position:fixed;z-index:2147483647;right:10px;bottom:10px;font:12px/1.2 Segoe UI,system-ui,sans-serif;color:#fff;background:#6b746b;padding:5px 9px;border-radius:8px;opacity:.85;box-shadow:0 2px 8px rgba(0,0,0,.25);pointer-events:none';
+      badge.textContent = 'Faltantes: iniciando…';
+      document.body.appendChild(badge);
+    }catch(e){}
   }
 
-  function registrar(plataforma, claves) {
+  function enviar(claves) {
+    if (!PLATAFORMA) return;
+    try {
+      GM_xmlhttpRequest({
+        method: 'POST', url: PUENTE, headers: { 'Content-Type': 'application/json' },
+        data: JSON.stringify({ platform: PLATAFORMA, keys: claves }), timeout: 4000,
+        onload: function () { badgeTxt('conectado (' + claves.length + ' activos)', '#2f7d4f'); },
+        onerror: function () { badgeTxt('no encuentra el puente', '#b3402a'); log('error enviando (¿puente abierto?)'); },
+        ontimeout: function () { badgeTxt('sin respuesta del puente', '#b3402a'); }
+      });
+    } catch (e) { badgeTxt('error (Tampermonkey)', '#b3402a'); log('GM_xmlhttpRequest no disponible', e); }
+  }
+  function registrar(claves) {
     var firma = JSON.stringify(claves.slice().sort());
-    if (ultimaFirma[plataforma] === firma) return; // sin cambios: el latido lo reenvia
-    ultimaFirma[plataforma] = firma;
-    ultimasClaves[plataforma] = claves;
-    enviar(plataforma, claves);
+    ultimasClaves = claves;
+    if (ultimaFirma === firma) return;
+    ultimaFirma = firma;
+    log('activos en', PLATAFORMA, '=', claves.length, claves);
+    enviar(claves);
   }
 
   function procesar(url, texto) {
     try {
       if (/orders-live/i.test(url)) {
-        var j = JSON.parse(texto);
-        var data = (j && j.data) || [];
-        var claves = [];
-        for (var i = 0; i < data.length; i++) {
-          var o = data[i];
-          if (o && o.state === 'in_store' && o.id != null) claves.push(String(o.id)); // en tienda = aun lo debo
-        }
-        registrar('Rappi', claves);
+        var j = JSON.parse(texto); var data = (j && j.data) || []; var cl = [];
+        for (var i = 0; i < data.length; i++) { var o = data[i]; if (o && o.state === 'in_store' && o.id != null) cl.push(String(o.id)); }
+        registrar(cl);
       } else if (/deliveries-win/i.test(url)) {
-        var arr = JSON.parse(texto);
-        if (!Array.isArray(arr)) return;
-        var cl = [];
-        for (var k = 0; k < arr.length; k++) {
-          var p = arr[k];
-          if (!p) continue;
-          if (PEYA_FUERA.test(String(p.state || ''))) continue; // cancelado/entregado/recogido = fuera
-          if (p.externalId != null) cl.push(String(p.externalId));
-          if (p.shortCode != null) cl.push(String(p.shortCode));
-        }
-        registrar('PedidosYa', cl);
+        var arr = JSON.parse(texto); if (!Array.isArray(arr)) return; var c2 = [];
+        for (var k = 0; k < arr.length; k++) { var p = arr[k]; if (!p) continue; if (PEYA_FUERA.test(String(p.state || ''))) continue; if (p.externalId != null) c2.push(String(p.externalId)); if (p.shortCode != null) c2.push(String(p.shortCode)); }
+        registrar(c2);
       }
-    } catch (e) {}
+    } catch (e) { log('no se pudo leer respuesta', e); }
   }
 
   // Interceptar fetch
@@ -77,10 +77,7 @@
       window.fetch = function () {
         var args = arguments;
         return _fetch.apply(this, args).then(function (r) {
-          try {
-            var u = (r && r.url) || ('' + args[0]);
-            if (/orders-live|deliveries-win/i.test(u)) { r.clone().text().then(function (t) { procesar(u, t); }).catch(function () {}); }
-          } catch (e) {}
+          try { var u = (r && r.url) || ('' + args[0]); if (/orders-live|deliveries-win/i.test(u)) { r.clone().text().then(function (t) { procesar(u, t); }).catch(function () {}); } } catch (e) {}
           return r;
         });
       };
@@ -89,20 +86,24 @@
 
   // Interceptar XMLHttpRequest
   try {
-    var _open = XMLHttpRequest.prototype.open;
-    var _send = XMLHttpRequest.prototype.send;
+    var _open = XMLHttpRequest.prototype.open, _send = XMLHttpRequest.prototype.send;
     XMLHttpRequest.prototype.open = function (m, u) { this.__faltUrl = u; return _open.apply(this, arguments); };
     XMLHttpRequest.prototype.send = function () {
       var self = this;
-      this.addEventListener('load', function () {
-        try { if (/orders-live|deliveries-win/i.test(self.__faltUrl || '')) procesar(self.__faltUrl, self.responseText); } catch (e) {}
-      });
+      this.addEventListener('load', function () { try { if (/orders-live|deliveries-win/i.test(self.__faltUrl || '')) procesar(self.__faltUrl, self.responseText); } catch (e) {} });
       return _send.apply(this, arguments);
     };
   } catch (e) {}
 
-  // Latido: reenviar las ultimas claves cada 30s para que el puente sepa que la lectura sigue fresca.
-  setInterval(function () {
-    for (var p in ultimasClaves) { if (Object.prototype.hasOwnProperty.call(ultimasClaves, p)) enviar(p, ultimasClaves[p]); }
-  }, 30000);
+  // Arranque: badge + saludo inmediato al puente (claves vacias) para confirmar conexion.
+  function iniciar() {
+    ponerBadge();
+    log('detector cargado en', PLATAFORMA || host);
+    enviar([]); // saludo: aparece en http://localhost:8787/api/activos aunque aun no haya pedidos
+  }
+  if (document.body) iniciar();
+  else document.addEventListener('DOMContentLoaded', iniciar);
+
+  // Latido: reenviar las ultimas claves cada 20s (mantiene fresca la senal en el puente).
+  setInterval(function () { enviar(ultimasClaves); }, 20000);
 })();
