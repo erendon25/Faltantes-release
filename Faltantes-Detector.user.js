@@ -1,14 +1,17 @@
 // ==UserScript==
 // @name         Faltantes - Detector de entregas (Rappi / PedidosYa)
 // @namespace    faltantes-delivery
-// @version      1.1.3
-// @description  Lee que pedidos siguen activos en las paginas de Rappi y PedidosYa y le avisa a Faltantes para retirar solos los ya entregados.
+// @version      1.2.0
+// @description  Lee que pedidos siguen activos en Rappi y PedidosYa y le avisa a Faltantes para retirar solos los ya entregados.
 // @author       Erick R.
 // @match        https://aliados.rappi.com/*
 // @match        https://web.us.restaurant-partners.com/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
 // @connect      localhost
+// @connect      rappi.pe
+// @connect      restaurant-partners.com
+// @connect      *
 // @downloadURL  https://raw.githubusercontent.com/erendon25/Faltantes-release/main/Faltantes-Detector.user.js
 // @updateURL    https://raw.githubusercontent.com/erendon25/Faltantes-release/main/Faltantes-Detector.user.js
 // ==/UserScript==
@@ -17,13 +20,14 @@
   var PUENTE = 'http://localhost:8787/api/activos';
   var host = (location.host || '');
   var PLATAFORMA = /rappi/i.test(host) ? 'Rappi' : (/restaurant-partners/i.test(host) ? 'PedidosYa' : '');
+
   var ultimaFirma = null, ultimasClaves = [];
-  var peyaMap = {};  // PeYa: externalId -> { shortCode, state, ts }. Recordamos cada pedido y su ultimo estado.
+  var tpl = null;        // plantilla para re-consultar: { url, headers, fromVal }
   function log(){ try{ console.log.apply(console, ['[Faltantes]'].concat([].slice.call(arguments))); }catch(e){} }
 
-  // --- Distintivo visible en la esquina (para saber que esta corriendo sin abrir DevTools) ---
+  // ---- Distintivo visible ----
   var badge;
-  function badgeTxt(t, color){ try{ if(!badge) return; badge.textContent = 'Faltantes: ' + t; badge.style.background = color; }catch(e){} }
+  function badgeTxt(t, color){ try{ if(badge){ badge.textContent = 'Faltantes: ' + t; badge.style.background = color; } }catch(e){} }
   function ponerBadge(){
     try{
       if (badge || !document.body) return;
@@ -41,92 +45,116 @@
         method: 'POST', url: PUENTE, headers: { 'Content-Type': 'application/json' },
         data: JSON.stringify({ platform: PLATAFORMA, keys: claves }), timeout: 4000,
         onload: function () { badgeTxt('conectado (' + claves.length + ' activos)', '#2f7d4f'); },
-        onerror: function () { badgeTxt('no encuentra el puente', '#b3402a'); log('error enviando (¿puente abierto?)'); },
+        onerror: function () { badgeTxt('no encuentra el puente', '#b3402a'); },
         ontimeout: function () { badgeTxt('sin respuesta del puente', '#b3402a'); }
       });
-    } catch (e) { badgeTxt('error (Tampermonkey)', '#b3402a'); log('GM_xmlhttpRequest no disponible', e); }
+    } catch (e) { badgeTxt('error (Tampermonkey)', '#b3402a'); }
   }
   function registrar(claves) {
-    var firma = JSON.stringify(claves.slice().sort());
     ultimasClaves = claves;
+    var firma = JSON.stringify(claves.slice().sort());
     if (ultimaFirma === firma) return;
     ultimaFirma = firma;
-    log('activos en', PLATAFORMA, '=', claves.length, claves);
+    log('activos', PLATAFORMA, '=', claves.length, claves);
     enviar(claves);
   }
 
-  function procesar(url, texto) {
+  // ---- Calcular el set de ACTIVOS desde una respuesta ----
+  // Rappi: activo = sigue en orders-live (cualquier estado). Si no aparece => ya salio.
+  // PeYa: activo = aparece con estado ACCEPTED. Entregado => desaparece de la lista. Cancelado => aparece con otro estado.
+  function calcular(texto) {
     try {
-      if (/orders-live/i.test(url)) {
-        // Rappi: activo mientras el pedido SIGA en la lista (cualquier estado: in_store u on_the_route).
-        // Solo se retira de Faltantes cuando desaparece de orders-live, o sea cuando ya no esta en la app.
+      if (PLATAFORMA === 'Rappi') {
         var j = JSON.parse(texto); var data = (j && j.data) || []; var cl = [];
         for (var i = 0; i < data.length; i++) { var o = data[i]; if (o && o.id != null) cl.push(String(o.id)); }
-        registrar(cl);
-      } else if (/deliveries-win/i.test(url)) {
-        // PeYa hace varias llamadas con filtros distintos (por pestana). No podemos confiar en que
-        // una sola respuesta traiga TODOS. Por eso acumulamos por pedido y solo lo damos de baja
-        // cuando vemos su estado FINAL (entregado/cancelado), nunca porque falte en una respuesta.
-        var arr = JSON.parse(texto); if (!Array.isArray(arr)) return;
-        var ahora = Date.now();
-        for (var k = 0; k < arr.length; k++) {
-          var p = arr[k]; if (!p || p.externalId == null) continue;
-          peyaMap[String(p.externalId)] = { shortCode: (p.shortCode != null ? String(p.shortCode) : null), state: String(p.state || ''), ts: ahora };
-        }
-        for (var idp in peyaMap) { if (ahora - peyaMap[idp].ts > 2700000) delete peyaMap[idp]; } // respaldo: purga >45 min
-        var c2 = [];
-        for (var id2 in peyaMap) {
-          var e = peyaMap[id2];
-          if (e.state !== 'ACCEPTED') continue;   // activo SOLO mientras siga ACCEPTED (incluye "listo"); cualquier otro estado = ya salio
-          c2.push(id2); if (e.shortCode) c2.push(e.shortCode);
-        }
-        registrar(c2);
+        return cl;
+      } else {
+        var arr = JSON.parse(texto); if (!Array.isArray(arr)) return null; var c2 = [];
+        for (var k = 0; k < arr.length; k++) { var p = arr[k]; if (!p || p.state !== 'ACCEPTED') continue; if (p.externalId != null) c2.push(String(p.externalId)); if (p.shortCode != null) c2.push(String(p.shortCode)); }
+        return c2;
       }
-    } catch (e) { log('no se pudo leer respuesta', e); }
+    } catch (e) { return null; }
   }
 
-  // Interceptar fetch
+  function getFrom(url){ try{ var m = String(url).match(/[?&]from=([^&]+)/i); return m ? decodeURIComponent(m[1]) : ''; }catch(e){ return ''; } }
+  function coincide(url){ return /orders-live|deliveries-win/i.test(String(url)); }
+  // Quita cabeceras que el navegador maneja solo (si las forzamos, la re-consulta puede fallar).
+  function limpiarHeaders(h){ var out = {}; if (!h) return out; var mal = /^(host|content-length|origin|referer|user-agent|cookie|connection|accept-encoding)$/i; for (var k in h){ if (Object.prototype.hasOwnProperty.call(h, k) && !mal.test(k)) out[k] = h[k]; } return out; }
+
+  // Guarda/actualiza la plantilla de re-consulta. Para PeYa conserva la de ventana mas amplia (from mas antiguo).
+  function guardarPlantilla(url, headers) {
+    var fromVal = getFrom(url);
+    var limpias = limpiarHeaders(headers);
+    if (PLATAFORMA === 'PedidosYa') {
+      if (!tpl || (fromVal && (!tpl.fromVal || fromVal < tpl.fromVal))) { tpl = { url: url, headers: limpias, fromVal: fromVal }; }
+      else if (tpl && getFrom(url) === tpl.fromVal) { tpl.headers = limpias; tpl.url = url; }
+    } else {
+      tpl = { url: url, headers: limpias, fromVal: fromVal };
+    }
+  }
+  // Procesa una respuesta como AUTORITATIVA (solo la llamada mas amplia en PeYa).
+  function procesarAutoritativa(url, texto) {
+    if (PLATAFORMA === 'PedidosYa' && tpl && getFrom(url) !== tpl.fromVal) return; // ignora llamadas filtradas (subconjuntos)
+    var claves = calcular(texto);
+    if (claves !== null) registrar(claves);
+  }
+
+  // ---- Interceptar fetch (captura plantilla + procesa) ----
   try {
     var _fetch = window.fetch;
     if (_fetch) {
       window.fetch = function () {
-        var args = arguments;
+        var args = arguments, url = ('' + (args[0] && args[0].url ? args[0].url : args[0]));
+        var hdrs = {};
+        try { var hi = (args[1] && args[1].headers) || (args[0] && args[0].headers); if (hi) { if (hi.forEach) hi.forEach(function(v,k){ hdrs[k]=v; }); else Object.keys(hi).forEach(function(k){ hdrs[k]=hi[k]; }); } } catch(e){}
         return _fetch.apply(this, args).then(function (r) {
-          try { var u = (r && r.url) || ('' + args[0]); if (/orders-live|deliveries-win/i.test(u)) { r.clone().text().then(function (t) { procesar(u, t); }).catch(function () {}); } } catch (e) {}
+          try { var u = (r && r.url) || url; if (coincide(u)) { guardarPlantilla(u, hdrs); r.clone().text().then(function (t) { procesarAutoritativa(u, t); }).catch(function(){}); } } catch (e) {}
           return r;
         });
       };
     }
   } catch (e) {}
 
-  // Interceptar XMLHttpRequest
+  // ---- Interceptar XMLHttpRequest (captura cabeceras + procesa) ----
   try {
-    var _open = XMLHttpRequest.prototype.open, _send = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open = function (m, u) { this.__faltUrl = u; return _open.apply(this, arguments); };
+    var _open = XMLHttpRequest.prototype.open, _setH = XMLHttpRequest.prototype.setRequestHeader, _send = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (m, u) { this.__u = u; this.__h = {}; return _open.apply(this, arguments); };
+    XMLHttpRequest.prototype.setRequestHeader = function (k, v) { try { this.__h[k] = v; } catch(e){} return _setH.apply(this, arguments); };
     XMLHttpRequest.prototype.send = function () {
       var self = this;
       this.addEventListener('load', function () {
         try {
-          if (!/orders-live|deliveries-win/i.test(self.__faltUrl || '')) return;
+          if (!coincide(self.__u || '')) return;
+          guardarPlantilla(self.__u, self.__h || {});
           var cuerpo = null;
-          try { cuerpo = self.responseText; } catch (e) { cuerpo = null; } // responseText no existe si responseType='json'
+          try { cuerpo = self.responseText; } catch (e) { cuerpo = null; }
           if (!cuerpo && self.response != null) { cuerpo = (typeof self.response === 'string') ? self.response : JSON.stringify(self.response); }
-          if (cuerpo) procesar(self.__faltUrl, cuerpo);
+          if (cuerpo) procesarAutoritativa(self.__u, cuerpo);
         } catch (e) {}
       });
       return _send.apply(this, arguments);
     };
   } catch (e) {}
 
-  // Arranque: badge + saludo inmediato al puente (claves vacias) para confirmar conexion.
+  // ---- Re-consulta propia cada 12s: asegura que detectemos entregas aunque la pagina no refresque sola ----
+  function reconsultar() {
+    if (!tpl || !tpl.url) return;
+    try {
+      GM_xmlhttpRequest({
+        method: 'GET', url: tpl.url, headers: tpl.headers || {}, timeout: 7000,
+        onload: function (r) { try { if (r.status >= 200 && r.status < 300 && r.responseText) procesarAutoritativa(tpl.url, r.responseText); } catch (e) {} },
+        onerror: function () {}, ontimeout: function () {}
+      });
+    } catch (e) {}
+  }
+
   function iniciar() {
     ponerBadge();
     log('detector cargado en', PLATAFORMA || host);
     enviar([]); // saludo: aparece en http://localhost:8787/api/activos aunque aun no haya pedidos
+    setInterval(reconsultar, 12000);
+    setInterval(function () { enviar(ultimasClaves); }, 20000); // latido: mantiene fresca la senal
   }
   if (document.body) iniciar();
   else document.addEventListener('DOMContentLoaded', iniciar);
-
-  // Latido: reenviar las ultimas claves cada 20s (mantiene fresca la senal en el puente).
-  setInterval(function () { enviar(ultimasClaves); }, 20000);
 })();
