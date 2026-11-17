@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Faltantes - Detector de entregas (Rappi / PedidosYa)
 // @namespace    faltantes-delivery
-// @version      1.1.0
+// @version      1.1.1
 // @description  Lee que pedidos siguen activos en las paginas de Rappi y PedidosYa y le avisa a Faltantes para retirar solos los ya entregados.
 // @author       Erick R.
 // @match        https://aliados.rappi.com/*
@@ -15,7 +15,9 @@
 (function () {
   'use strict';
   var PUENTE = 'http://localhost:8787/api/activos';
-  var PEYA_FUERA = /CANCEL|DELIVER|CLOSED|PICKED|DISPATCH|COMPLET|REJECT|VOID|EXPIRE/i;
+  // PeYa: solo estados FINALES (ya salio del aplicativo). NO incluye "listo"/preparado ni "en camino":
+  // el pedido sigue en la plataforma hasta que se ENTREGA (o se cancela), y solo ahi se retira de Faltantes.
+  var PEYA_FUERA = /CANCEL|DELIVER|CLOSED|REJECT|VOID|EXPIRE/i;
 
   var host = (location.host || '');
   var PLATAFORMA = /rappi/i.test(host) ? 'Rappi' : (/restaurant-partners/i.test(host) ? 'PedidosYa' : '');
@@ -59,8 +61,10 @@
   function procesar(url, texto) {
     try {
       if (/orders-live/i.test(url)) {
+        // Rappi: activo mientras el pedido SIGA en la lista (cualquier estado: in_store u on_the_route).
+        // Solo se retira de Faltantes cuando desaparece de orders-live, o sea cuando ya no esta en la app.
         var j = JSON.parse(texto); var data = (j && j.data) || []; var cl = [];
-        for (var i = 0; i < data.length; i++) { var o = data[i]; if (o && o.state === 'in_store' && o.id != null) cl.push(String(o.id)); }
+        for (var i = 0; i < data.length; i++) { var o = data[i]; if (o && o.id != null) cl.push(String(o.id)); }
         registrar(cl);
       } else if (/deliveries-win/i.test(url)) {
         var arr = JSON.parse(texto); if (!Array.isArray(arr)) return; var c2 = [];
