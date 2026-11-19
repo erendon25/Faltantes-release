@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Faltantes - Detector de entregas (Rappi / PedidosYa)
 // @namespace    faltantes-delivery
-// @version      1.2.7
+// @version      1.2.8
 // @description  Lee que pedidos siguen activos en Rappi y PedidosYa y le avisa a Faltantes para retirar solos los ya entregados.
 // @author       Erick R.
 // @match        https://aliados.rappi.com/*
@@ -17,7 +17,7 @@
 // ==/UserScript==
 (function () {
   'use strict';
-  var VERSION = '1.2.7';
+  var VERSION = '1.2.8';
   var PUENTE = 'http://localhost:8787/api/activos';
   var host = (location.host || '');
   var PLATAFORMA = /rappi/i.test(host) ? 'Rappi' : (/restaurant-partners/i.test(host) ? 'PedidosYa' : '');
@@ -146,19 +146,28 @@
         track[a.pk] = { keys: a.keys, detailId: a.detailId, misses: 0 }; presentes[a.pk] = true;
       }
     }
-    for (var pk in track) { if (Object.prototype.hasOwnProperty.call(track, pk) && !presentes[pk]) { track[pk].misses++; if (PLATAFORMA !== 'PedidosYa' && track[pk].misses > 8) delete track[pk]; } }
-    emitirSeguimiento();
-    if (PLATAFORMA === 'PedidosYa') {
-      for (var pendiente in track) if (Object.prototype.hasOwnProperty.call(track, pendiente) && track[pendiente].misses >= UMBRAL) confirmarDetalle(pendiente);
+    for (var pk in track) {
+      if (Object.prototype.hasOwnProperty.call(track, pk) && !presentes[pk]) {
+        track[pk].misses++;
+        // Rappi: la ausencia retira; limpiamos el track tras un margen para no crecer sin fin.
+        // PeYa: NUNCA se retira por ausencia (el puente lo exige); se conserva hasta confirmar por ID.
+        if (PLATAFORMA !== 'PedidosYa' && track[pk].misses > 8) delete track[pk];
+      }
     }
+    emitirSeguimiento();
   }
 
   function emitirSeguimiento() {
     var send = [], entregados = [], cancelados = [], cantidad = 0;
     for (var pk in track) {
       if (!Object.prototype.hasOwnProperty.call(track, pk)) continue;
-      // En PeYa una ausencia no prueba entrega: mantenerlo hasta consultar el detalle.
-      if (PLATAFORMA !== 'PedidosYa' && track[pk].misses >= UMBRAL) continue;
+      if (track[pk].misses >= UMBRAL) {
+        // Rappi: la ausencia basta para retirar (el puente la interpreta como entrega).
+        if (PLATAFORMA !== 'PedidosYa') continue;
+        // PeYa: el puente NUNCA retira por ausencia; exige confirmacion por ID.
+        // Pedimos el detalle (muy espaciado) y el pedido sigue activo hasta confirmar.
+        confirmarDetalle(pk);
+      }
       send = send.concat(track[pk].keys); cantidad++;
     }
     for (var terminado in terminados) {
@@ -175,9 +184,10 @@
   // Un 404, error, respuesta incompleta o ACCEPTED conserva el pedido; nunca infiere entrega.
   function confirmarDetalle(pk) {
     var pedido = track[pk], base = tpl && String(tpl.url).match(/^(.*)\/2\/deliveries-win(?:[?#]|$)/i);
-    if (!pedido || !pedido.detailId || !base || pedido.checking || consultasDetalle >= 2 || (pedido.retryAt || 0) > Date.now()) return;
+    // Anti-robot: una sola consulta de detalle a la vez y muy espaciada por pedido.
+    if (!pedido || !pedido.detailId || !base || pedido.checking || consultasDetalle >= 1 || (pedido.retryAt || 0) > Date.now()) return;
     pedido.checking = true; consultasDetalle++;
-    function finalizar() { pedido.checking = false; pedido.retryAt = Date.now() + 10000; consultasDetalle--; }
+    function finalizar() { pedido.checking = false; pedido.retryAt = Date.now() + 60000; consultasDetalle--; }
     try {
       GM_xmlhttpRequest({
         method: 'GET', url: base[1] + '/1/deliveries/' + encodeURIComponent(pedido.detailId),
@@ -240,7 +250,7 @@
     };
   } catch (e) {}
 
-  // ---- Re-consulta propia cada 5s: dos ausencias confirmadas sin recargar la pagina ----
+  // ---- Re-consulta propia muy espaciada (PeYa ~90s, Rappi ~12s): backstop sin recargar ----
   function reconsultar() {
     if (consultando) return;
     if (!tpl || !tpl.url) { log('re-consulta: aun sin plantilla'); return; }
@@ -273,7 +283,12 @@
     log('detector cargado en', PLATAFORMA || host);
     badgeTxt('esperando lectura de ' + PLATAFORMA, '#6b746b');
     // El inicio y los errores no son listas vacias: solo se envia tras leer la app.
-    setInterval(reconsultar, 5000);
+    // PeYa marca como "robot" las llamadas frecuentes: re-consultamos MUY espaciado y con variacion
+    // aleatoria, y nos apoyamos en las lecturas que la propia pagina hace (que interceptamos gratis).
+    // Rappi no marca y necesita la re-consulta (usa Firebase y no re-pide la lista solo).
+    var base = (PLATAFORMA === 'PedidosYa') ? 90000 : 12000;
+    var jitter = Math.floor(Math.random() * Math.round(base * 0.3));
+    setInterval(function () { try { reconsultar(); } catch (e) {} }, base + jitter);
   }
   if (document.body) iniciar();
   else document.addEventListener('DOMContentLoaded', iniciar);
