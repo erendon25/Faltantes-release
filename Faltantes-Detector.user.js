@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Faltantes - Detector de entregas (Rappi / PedidosYa)
 // @namespace    faltantes-delivery
-// @version      1.2.8
+// @version      1.2.9
 // @description  Lee que pedidos siguen activos en Rappi y PedidosYa y le avisa a Faltantes para retirar solos los ya entregados.
 // @author       Erick R.
 // @match        https://aliados.rappi.com/*
@@ -17,7 +17,7 @@
 // ==/UserScript==
 (function () {
   'use strict';
-  var VERSION = '1.2.8';
+  var VERSION = '1.2.9';
   var PUENTE = 'http://localhost:8787/api/activos';
   var host = (location.host || '');
   var PLATAFORMA = /rappi/i.test(host) ? 'Rappi' : (/restaurant-partners/i.test(host) ? 'PedidosYa' : '');
@@ -27,6 +27,7 @@
   var tpl = null;        // plantilla para re-consultar: { url, headers, fromVal }
   var track = {};        // pk -> { keys:[...], misses:N }. Un pedido se quita solo si falta en varias lecturas seguidas.
   var terminados = {}, consultasDetalle = 0;
+  var huboLectura = false; // hubo lectura autoritativa desde el ultimo tic (la propia pagina ya esta leyendo)
   var UMBRAL = 2;        // lecturas seguidas sin aparecer antes de darlo por salido (evita borrar por 1 lectura mala)
   function log(){ try{ console.log.apply(console, ['[Faltantes]'].concat([].slice.call(arguments))); }catch(e){} }
 
@@ -122,8 +123,13 @@
     var limpias = limpiarHeaders(headers);
     var m = metodo || 'GET'; var b = (body != null ? body : null);
     if (PLATAFORMA === 'PedidosYa') {
-      if (!tpl || (fromVal && (!tpl.fromVal || fromVal < tpl.fromVal))) { tpl = { url: url, headers: limpias, fromVal: fromVal, metodo: m, body: b }; }
-      else if (tpl && getFrom(url) === tpl.fromVal) { tpl.headers = limpias; tpl.url = url; tpl.metodo = m; tpl.body = b; }
+      var ahora = Date.now();
+      // Si la pagina dejo de usar la ventana guardada (p. ej. cambio el dia), adoptar la que usa ahora.
+      // Es seguro: en PeYa una ausencia solo dispara la confirmacion por ID, nunca retira por si sola.
+      var abandonada = tpl && fromVal !== tpl.fromVal && (ahora - (tpl.visto || 0)) > 180000;
+      if (!tpl || (fromVal && (!tpl.fromVal || fromVal < tpl.fromVal)) || abandonada) { tpl = { url: url, headers: limpias, fromVal: fromVal, metodo: m, body: b, visto: ahora }; }
+      else if (fromVal === tpl.fromVal) { tpl.headers = limpias; tpl.url = url; tpl.metodo = m; tpl.body = b; tpl.visto = ahora; }
+      else { for (var hk in limpias) { if (Object.prototype.hasOwnProperty.call(limpias, hk)) { tpl.headers = limpias; break; } } } // credenciales frescas de la app
     } else {
       tpl = { url: url, headers: limpias, fromVal: fromVal, metodo: m, body: b };
     }
@@ -134,7 +140,7 @@
     if (lectura <= ultimaLectura) return; // una respuesta vieja no pisa una mas reciente
     var activos = calcular(texto);
     if (activos === null) return; // respuesta ilegible: no tocar nada
-    ultimaLectura = lectura;
+    ultimaLectura = lectura; huboLectura = true;
     var presentes = {};
     for (var i = 0; i < activos.length; i++) {
       var a = activos[i];
@@ -161,13 +167,11 @@
     var send = [], entregados = [], cancelados = [], cantidad = 0;
     for (var pk in track) {
       if (!Object.prototype.hasOwnProperty.call(track, pk)) continue;
-      if (track[pk].misses >= UMBRAL) {
-        // Rappi: la ausencia basta para retirar (el puente la interpreta como entrega).
-        if (PLATAFORMA !== 'PedidosYa') continue;
+      if (PLATAFORMA === 'PedidosYa') {
         // PeYa: el puente NUNCA retira por ausencia; exige confirmacion por ID.
-        // Pedimos el detalle (muy espaciado) y el pedido sigue activo hasta confirmar.
-        confirmarDetalle(pk);
-      }
+        // Apenas falta, se pide su detalle; mientras tanto sigue activo.
+        if (track[pk].misses >= 1) confirmarDetalle(pk);
+      } else if (track[pk].misses >= UMBRAL) continue; // Rappi: la ausencia basta (el puente la toma como entrega)
       send = send.concat(track[pk].keys); cantidad++;
     }
     for (var terminado in terminados) {
@@ -180,33 +184,56 @@
     registrar(send, entregados, cancelados, cantidad);
   }
 
-  // PedidosYa tambien verifica /1/deliveries/{id} cuando falta un pedido en deliveries-win.
+  // PeYa: las consultas salen DESDE LA PROPIA PAGINA (mismo origen, cookies y cabeceras de la app),
+  // iguales a las que hace la app. Desde Tampermonkey (fuera de la pagina) PeYa las marca como robot.
+  function pedirPeYa(metodo, url, headers, body, timeoutMs, cb) {
+    var hecho = false;
+    function fin(status, texto) { if (hecho) return; hecho = true; try { cb(status, texto || ''); } catch (e) {} }
+    try {
+      if (typeof _fetch !== 'function') throw new Error('sin fetch');
+      var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+      var timer = setTimeout(function () { try { if (ctrl) ctrl.abort(); } catch (e) {} fin(0, ''); }, timeoutMs);
+      var init = { method: metodo || 'GET', headers: headers || {}, credentials: 'include', cache: 'no-store' };
+      if (body != null && String(init.method).toUpperCase() !== 'GET') init.body = body;
+      if (ctrl) init.signal = ctrl.signal;
+      _fetch(url, init).then(function (r) {
+        return (r.text ? r.text() : r.clone().text()).then(function (t) { clearTimeout(timer); fin(r.status, t); });
+      }).catch(function () { clearTimeout(timer); fin(0, ''); });
+    } catch (e) {
+      try { // respaldo si la pagina no expone fetch
+        GM_xmlhttpRequest({ method: metodo || 'GET', url: url, headers: headers || {}, data: body, timeout: timeoutMs,
+          onload: function (r) { fin(r.status, r.responseText); }, onerror: function () { fin(0, ''); },
+          ontimeout: function () { fin(0, ''); }, onabort: function () { fin(0, ''); } });
+      } catch (e2) { fin(0, ''); }
+    }
+  }
+  function avisoHttp(status) {
+    log('PedidosYa respondio', status || 'sin conexion');
+    badgeTxt('PedidosYa respondio ' + (status ? 'HTTP ' + status : 'sin conexion') + ' (reintenta)', '#b8741a');
+  }
+
+  // PedidosYa verifica /1/deliveries/{id} cuando falta un pedido en deliveries-win.
   // Un 404, error, respuesta incompleta o ACCEPTED conserva el pedido; nunca infiere entrega.
   function confirmarDetalle(pk) {
     var pedido = track[pk], base = tpl && String(tpl.url).match(/^(.*)\/2\/deliveries-win(?:[?#]|$)/i);
-    // Anti-robot: una sola consulta de detalle a la vez y muy espaciada por pedido.
-    if (!pedido || !pedido.detailId || !base || pedido.checking || consultasDetalle >= 1 || (pedido.retryAt || 0) > Date.now()) return;
+    if (!pedido || !pedido.detailId || !base || pedido.checking || consultasDetalle >= 2 || (pedido.retryAt || 0) > Date.now()) return;
     pedido.checking = true; consultasDetalle++;
-    function finalizar() { pedido.checking = false; pedido.retryAt = Date.now() + 60000; consultasDetalle--; }
-    try {
-      GM_xmlhttpRequest({
-        method: 'GET', url: base[1] + '/1/deliveries/' + encodeURIComponent(pedido.detailId),
-        headers: limpiarHeaders(tpl.headers), timeout: 7000,
-        onload: function (r) {
-          finalizar();
-          if (track[pk] !== pedido || r.status < 200 || r.status >= 300) return;
-          try {
-            var p = JSON.parse(r.responseText);
-            if (!p || String(p.id) !== pedido.detailId || String(p.externalId) !== pk) return;
-            var estado = estadoPeYa(p);
-            if (estado === 'open') return;
-            delete track[pk]; terminados[pk] = { keys: pedido.keys, kind: estado };
-            emitirSeguimiento();
-          } catch (e) {}
-        },
-        onerror: finalizar, ontimeout: finalizar
-      });
-    } catch (e) { finalizar(); }
+    pedirPeYa('GET', base[1] + '/1/deliveries/' + encodeURIComponent(pedido.detailId), limpiarHeaders(tpl.headers), null, 8000, function (status, texto) {
+      // Espera creciente si sigue sin confirmarse: 20s, 40s, 80s... hasta 5 min (no insistir como robot).
+      pedido.intentos = (pedido.intentos || 0) + 1;
+      pedido.checking = false; consultasDetalle--;
+      pedido.retryAt = Date.now() + Math.min(300000, 20000 * Math.pow(2, pedido.intentos - 1));
+      if (status < 200 || status >= 300) { if (status !== 404) avisoHttp(status); return; }
+      if (track[pk] !== pedido) return;
+      try {
+        var p = JSON.parse(texto);
+        if (!p || String(p.id) !== pedido.detailId || String(p.externalId) !== pk) return;
+        var estado = estadoPeYa(p);
+        if (estado === 'open') return;
+        delete track[pk]; terminados[pk] = { keys: pedido.keys, kind: estado };
+        emitirSeguimiento();
+      } catch (e) {}
+    });
   }
 
   // ---- Interceptar fetch (captura plantilla + procesa) ----
@@ -250,7 +277,7 @@
     };
   } catch (e) {}
 
-  // ---- Re-consulta propia muy espaciada (PeYa ~90s, Rappi ~12s): backstop sin recargar ----
+  // ---- Re-consulta propia (Rappi ~12s; PeYa solo si la pagina no leyo nada en el ultimo tic) ----
   function reconsultar() {
     if (consultando) return;
     if (!tpl || !tpl.url) { log('re-consulta: aun sin plantilla'); return; }
@@ -258,6 +285,15 @@
     try {
       var lectura = ++secuencia, urlOrigen = tpl.url;
       var esGet = String(tpl.metodo || 'GET').toUpperCase() === 'GET';
+      if (PLATAFORMA === 'PedidosYa') {
+        pedirPeYa(tpl.metodo || 'GET', tpl.url, limpiarHeaders(tpl.headers), esGet ? null : tpl.body, 8000, function (status, t) {
+          consultando = false;
+          log('re-consulta', PLATAFORMA, 'HTTP', status, 'len', t.length);
+          if (status >= 200 && status < 300 && t) { try { procesarAutoritativa(urlOrigen, t, lectura); } catch (e) { log('re-consulta parse err', e); } }
+          else avisoHttp(status);
+        });
+        return;
+      }
       var url = tpl.url;
       if (esGet) url += (url.indexOf('?') >= 0 ? '&' : '?') + '__fcb=' + Date.now(); // rompe cache: trae la lista fresca
       var cab = {}; for (var k in (tpl.headers || {})) { if (Object.prototype.hasOwnProperty.call(tpl.headers, k)) cab[k] = tpl.headers[k]; }
@@ -283,12 +319,16 @@
     log('detector cargado en', PLATAFORMA || host);
     badgeTxt('esperando lectura de ' + PLATAFORMA, '#6b746b');
     // El inicio y los errores no son listas vacias: solo se envia tras leer la app.
-    // PeYa marca como "robot" las llamadas frecuentes: re-consultamos MUY espaciado y con variacion
-    // aleatoria, y nos apoyamos en las lecturas que la propia pagina hace (que interceptamos gratis).
-    // Rappi no marca y necesita la re-consulta (usa Firebase y no re-pide la lista solo).
-    var base = (PLATAFORMA === 'PedidosYa') ? 90000 : 12000;
-    var jitter = Math.floor(Math.random() * Math.round(base * 0.3));
-    setInterval(function () { try { reconsultar(); } catch (e) {} }, base + jitter);
+    if (PLATAFORMA === 'PedidosYa') {
+      // PeYa refresca su lista sola y esas lecturas se interceptan gratis. Solo consultamos si en el
+      // ultimo tic (~15-20s) no hubo ninguna lectura: como mucho ~2 por minuto y desde la pagina.
+      var cada = 15000 + Math.floor(Math.random() * 5000);
+      setInterval(function () { try { if (huboLectura) { huboLectura = false; return; } reconsultar(); } catch (e) {} }, cada);
+    } else {
+      // Rappi usa Firebase y no re-pide la lista sola: necesita la re-consulta.
+      var base = 12000, jitter = Math.floor(Math.random() * Math.round(base * 0.3));
+      setInterval(function () { try { reconsultar(); } catch (e) {} }, base + jitter);
+    }
   }
   if (document.body) iniciar();
   else document.addEventListener('DOMContentLoaded', iniciar);
