@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Faltantes - Detector de entregas (Rappi / PedidosYa)
 // @namespace    faltantes-delivery
-// @version      1.2.9
+// @version      1.2.10
 // @description  Lee que pedidos siguen activos en Rappi y PedidosYa y le avisa a Faltantes para retirar solos los ya entregados.
 // @author       Erick R.
 // @match        https://aliados.rappi.com/*
@@ -17,7 +17,7 @@
 // ==/UserScript==
 (function () {
   'use strict';
-  var VERSION = '1.2.9';
+  var VERSION = '1.2.10';
   var PUENTE = 'http://localhost:8787/api/activos';
   var host = (location.host || '');
   var PLATAFORMA = /rappi/i.test(host) ? 'Rappi' : (/restaurant-partners/i.test(host) ? 'PedidosYa' : '');
@@ -106,6 +106,14 @@
     } catch (e) { return null; }
   }
 
+  function absoluta(u) {
+    var v = String(u || '');
+    if (/^https?:\/\//i.test(v)) return v;
+    var proto = (location && location.protocol) || 'https:';
+    if (v.indexOf('//') === 0) return proto + v;
+    if (v.charAt(0) === '/') return proto + '//' + location.host + v;
+    return v;
+  }
   function getFrom(url){ try{ var m = String(url).match(/[?&]from=([^&]+)/i); return m ? decodeURIComponent(m[1]) : ''; }catch(e){ return ''; } }
   function coincide(url){
     var value = String(url);
@@ -117,8 +125,9 @@
   // Quita cabeceras que el navegador maneja solo (si las forzamos, la re-consulta puede fallar).
   function limpiarHeaders(h){ var out = {}; if (!h) return out; var mal = /^(host|content-length|origin|referer|user-agent|cookie|connection|accept-encoding)$/i; for (var k in h){ if (Object.prototype.hasOwnProperty.call(h, k) && !mal.test(k)) out[k] = h[k]; } return out; }
 
+  function hayCabeceras(h) { for (var k in h) { if (Object.prototype.hasOwnProperty.call(h, k)) return true; } return false; }
   // Guarda/actualiza la plantilla de re-consulta. Para PeYa conserva la de ventana mas amplia (from mas antiguo).
-  function guardarPlantilla(url, headers, metodo, body) {
+  function guardarPlantilla(url, headers, metodo, body, via, cred) {
     var fromVal = getFrom(url);
     var limpias = limpiarHeaders(headers);
     var m = metodo || 'GET'; var b = (body != null ? body : null);
@@ -127,11 +136,11 @@
       // Si la pagina dejo de usar la ventana guardada (p. ej. cambio el dia), adoptar la que usa ahora.
       // Es seguro: en PeYa una ausencia solo dispara la confirmacion por ID, nunca retira por si sola.
       var abandonada = tpl && fromVal !== tpl.fromVal && (ahora - (tpl.visto || 0)) > 180000;
-      if (!tpl || (fromVal && (!tpl.fromVal || fromVal < tpl.fromVal)) || abandonada) { tpl = { url: url, headers: limpias, fromVal: fromVal, metodo: m, body: b, visto: ahora }; }
-      else if (fromVal === tpl.fromVal) { tpl.headers = limpias; tpl.url = url; tpl.metodo = m; tpl.body = b; tpl.visto = ahora; }
-      else { for (var hk in limpias) { if (Object.prototype.hasOwnProperty.call(limpias, hk)) { tpl.headers = limpias; break; } } } // credenciales frescas de la app
+      if (!tpl || (fromVal && (!tpl.fromVal || fromVal < tpl.fromVal)) || abandonada) { tpl = { url: url, headers: limpias, fromVal: fromVal, metodo: m, body: b, visto: ahora, via: via, cred: cred }; }
+      else if (fromVal === tpl.fromVal) { if (hayCabeceras(limpias)) tpl.headers = limpias; tpl.url = url; tpl.metodo = m; tpl.body = b; tpl.visto = ahora; tpl.via = via; tpl.cred = cred; }
+      else if (hayCabeceras(limpias)) { tpl.headers = limpias; } // credenciales frescas de la app
     } else {
-      tpl = { url: url, headers: limpias, fromVal: fromVal, metodo: m, body: b };
+      tpl = { url: url, headers: limpias, fromVal: fromVal, metodo: m, body: b, via: via, cred: cred };
     }
   }
   // Procesa una respuesta como AUTORITATIVA (solo la llamada mas amplia en PeYa).
@@ -187,29 +196,58 @@
   // PeYa: las consultas salen DESDE LA PROPIA PAGINA (mismo origen, cookies y cabeceras de la app),
   // iguales a las que hace la app. Desde Tampermonkey (fuera de la pagina) PeYa las marca como robot.
   function pedirPeYa(metodo, url, headers, body, timeoutMs, cb) {
-    var hecho = false;
-    function fin(status, texto) { if (hecho) return; hecho = true; try { cb(status, texto || ''); } catch (e) {} }
-    try {
-      if (typeof _fetch !== 'function') throw new Error('sin fetch');
-      var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-      var timer = setTimeout(function () { try { if (ctrl) ctrl.abort(); } catch (e) {} fin(0, ''); }, timeoutMs);
-      var init = { method: metodo || 'GET', headers: headers || {}, credentials: 'include', cache: 'no-store' };
-      if (body != null && String(init.method).toUpperCase() !== 'GET') init.body = body;
-      if (ctrl) init.signal = ctrl.signal;
-      _fetch(url, init).then(function (r) {
-        return (r.text ? r.text() : r.clone().text()).then(function (t) { clearTimeout(timer); fin(r.status, t); });
-      }).catch(function () { clearTimeout(timer); fin(0, ''); });
-    } catch (e) {
-      try { // respaldo si la pagina no expone fetch
-        GM_xmlhttpRequest({ method: metodo || 'GET', url: url, headers: headers || {}, data: body, timeout: timeoutMs,
-          onload: function (r) { fin(r.status, r.responseText); }, onerror: function () { fin(0, ''); },
-          ontimeout: function () { fin(0, ''); }, onabort: function () { fin(0, ''); } });
-      } catch (e2) { fin(0, ''); }
+    var hecho = false, via = (tpl && tpl.via) || 'xhr', cred = (tpl && tpl.cred) || '';
+    url = absoluta(url);
+    metodo = metodo || 'GET';
+    var conCuerpo = body != null && String(metodo).toUpperCase() !== 'GET';
+    function terminar(status, texto, motivo) { if (hecho) return; hecho = true; try { cb(status, texto || '', motivo || ''); } catch (e) {} }
+    // Respaldo (como en versiones anteriores) solo si la consulta desde la pagina no pudo salir.
+    function porGM(motivoPagina) {
+      try {
+        GM_xmlhttpRequest({ method: metodo, url: url, headers: headers || {}, data: conCuerpo ? body : undefined, timeout: timeoutMs,
+          onload: function (r) { if (r.status) log('PedidosYa: respondio por respaldo (Tampermonkey)', r.status); terminar(r.status, r.responseText, motivoPagina); },
+          onerror: function () { terminar(0, '', motivoPagina + ' / respaldo: error de red'); },
+          ontimeout: function () { terminar(0, '', motivoPagina + ' / respaldo: tiempo agotado'); },
+          onabort: function () { terminar(0, '', motivoPagina + ' / respaldo: cancelado'); } });
+      } catch (e) { terminar(0, '', motivoPagina + ' / respaldo: ' + (e && e.message)); }
     }
+    function listo(status, texto, motivo) {
+      if (status) { terminar(status, texto); return; }
+      log('PedidosYa: la consulta desde la pagina no salio (' + motivo + ')', via, url);
+      porGM(motivo);
+    }
+    // Desde la propia pagina, IGUAL que la app: mismo mecanismo (XHR o fetch), mismas credenciales.
+    if (via === 'fetch' && typeof _fetch === 'function') {
+      var hechoF = false;
+      var fin = function (st, tx, mo) { if (hechoF) return; hechoF = true; listo(st, tx, mo); };
+      try {
+        var timer = setTimeout(function () { fin(0, '', 'fetch: tiempo agotado'); }, timeoutMs);
+        var init = { method: metodo, headers: headers || {}, cache: 'no-store' };
+        if (cred) init.credentials = cred;
+        if (conCuerpo) init.body = body;
+        _fetch(url, init).then(function (r) {
+          return (r.text ? r.text() : r.clone().text()).then(function (t) { clearTimeout(timer); fin(r.status, t); });
+        }).catch(function (e) { clearTimeout(timer); fin(0, '', 'fetch: ' + ((e && e.message) || 'error')); });
+      } catch (e) { fin(0, '', 'fetch: ' + ((e && e.message) || 'error')); }
+      return;
+    }
+    try {
+      var x = new XMLHttpRequest(), hechoX = false;
+      var finX = function (st, tx, mo) { if (hechoX) return; hechoX = true; listo(st, tx, mo); };
+      _open.call(x, metodo, url, true);
+      try { x.withCredentials = (cred === 'include'); } catch (e) {}
+      try { x.timeout = timeoutMs; } catch (e) {}
+      for (var k in (headers || {})) { if (Object.prototype.hasOwnProperty.call(headers, k)) { try { _setH.call(x, k, headers[k]); } catch (e) {} } }
+      x.onload = function () { var t = ''; try { t = x.responseText; } catch (e) {} if (!t && x.response != null) t = (typeof x.response === 'string') ? x.response : JSON.stringify(x.response); finX(x.status, t, 'xhr: respuesta vacia'); };
+      x.onerror = function () { finX(0, '', 'xhr: error de red'); };
+      x.ontimeout = function () { finX(0, '', 'xhr: tiempo agotado'); };
+      x.onabort = function () { finX(0, '', 'xhr: cancelado'); };
+      _send.call(x, conCuerpo ? body : null);
+    } catch (e) { listo(0, '', 'xhr: ' + ((e && e.message) || 'error')); }
   }
-  function avisoHttp(status) {
-    log('PedidosYa respondio', status || 'sin conexion');
-    badgeTxt('PedidosYa respondio ' + (status ? 'HTTP ' + status : 'sin conexion') + ' (reintenta)', '#b8741a');
+  function avisoHttp(status, motivo) {
+    log('PedidosYa respondio', status || 'sin conexion', motivo || '');
+    badgeTxt(status ? 'PedidosYa respondio HTTP ' + status + ' (reintenta)' : 'PedidosYa sin respuesta: ' + (motivo || 'desconocido') + ' (reintenta)', '#b8741a');
   }
 
   // PedidosYa verifica /1/deliveries/{id} cuando falta un pedido en deliveries-win.
@@ -218,12 +256,12 @@
     var pedido = track[pk], base = tpl && String(tpl.url).match(/^(.*)\/2\/deliveries-win(?:[?#]|$)/i);
     if (!pedido || !pedido.detailId || !base || pedido.checking || consultasDetalle >= 2 || (pedido.retryAt || 0) > Date.now()) return;
     pedido.checking = true; consultasDetalle++;
-    pedirPeYa('GET', base[1] + '/1/deliveries/' + encodeURIComponent(pedido.detailId), limpiarHeaders(tpl.headers), null, 8000, function (status, texto) {
+    pedirPeYa('GET', base[1] + '/1/deliveries/' + encodeURIComponent(pedido.detailId), limpiarHeaders(tpl.headers), null, 8000, function (status, texto, motivo) {
       // Espera creciente si sigue sin confirmarse: 20s, 40s, 80s... hasta 5 min (no insistir como robot).
       pedido.intentos = (pedido.intentos || 0) + 1;
       pedido.checking = false; consultasDetalle--;
       pedido.retryAt = Date.now() + Math.min(300000, 20000 * Math.pow(2, pedido.intentos - 1));
-      if (status < 200 || status >= 300) { if (status !== 404) avisoHttp(status); return; }
+      if (status < 200 || status >= 300) { if (status !== 404) avisoHttp(status, motivo); return; }
       if (track[pk] !== pedido) return;
       try {
         var p = JSON.parse(texto);
@@ -246,9 +284,10 @@
         try { var hi = (args[1] && args[1].headers) || (args[0] && args[0].headers); if (hi) { if (hi.forEach) hi.forEach(function(v,k){ hdrs[k]=v; }); else Object.keys(hi).forEach(function(k){ hdrs[k]=hi[k]; }); } } catch(e){}
         var metodo = (args[1] && args[1].method) || (args[0] && args[0].method) || 'GET';
         var body = (args[1] && args[1].body) || null;
+        var cred = (args[1] && args[1].credentials) || (args[0] && typeof args[0] === 'object' && args[0].credentials) || '';
         var lectura = ++secuencia;
         return _fetch.apply(this, args).then(function (r) {
-          try { var u = (r && r.url) || url; if (r.status >= 200 && r.status < 300 && coincide(u)) { guardarPlantilla(u, hdrs, metodo, body); r.clone().text().then(function (t) { procesarAutoritativa(u, t, lectura); }).catch(function(){}); } } catch (e) {}
+          try { var u = (r && r.url) || url; if (r.status >= 200 && r.status < 300 && coincide(u)) { guardarPlantilla(u, hdrs, metodo, body, 'fetch', cred); r.clone().text().then(function (t) { procesarAutoritativa(u, t, lectura); }).catch(function(){}); } } catch (e) {}
           return r;
         });
       };
@@ -266,7 +305,7 @@
       this.addEventListener('load', function () {
         try {
           if (self.status < 200 || self.status >= 300 || !coincide(self.__u || '')) return;
-          guardarPlantilla(self.__u, self.__h || {}, self.__m, self.__b);
+          guardarPlantilla(self.__u, self.__h || {}, self.__m, self.__b, 'xhr', self.withCredentials ? 'include' : '');
           var cuerpo = null;
           try { cuerpo = self.responseText; } catch (e) { cuerpo = null; }
           if (!cuerpo && self.response != null) { cuerpo = (typeof self.response === 'string') ? self.response : JSON.stringify(self.response); }
@@ -286,11 +325,11 @@
       var lectura = ++secuencia, urlOrigen = tpl.url;
       var esGet = String(tpl.metodo || 'GET').toUpperCase() === 'GET';
       if (PLATAFORMA === 'PedidosYa') {
-        pedirPeYa(tpl.metodo || 'GET', tpl.url, limpiarHeaders(tpl.headers), esGet ? null : tpl.body, 8000, function (status, t) {
+        pedirPeYa(tpl.metodo || 'GET', tpl.url, limpiarHeaders(tpl.headers), esGet ? null : tpl.body, 8000, function (status, t, motivo) {
           consultando = false;
           log('re-consulta', PLATAFORMA, 'HTTP', status, 'len', t.length);
           if (status >= 200 && status < 300 && t) { try { procesarAutoritativa(urlOrigen, t, lectura); } catch (e) { log('re-consulta parse err', e); } }
-          else avisoHttp(status);
+          else avisoHttp(status, motivo);
         });
         return;
       }
