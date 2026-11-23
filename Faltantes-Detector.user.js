@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Faltantes - Detector de entregas (Rappi / PedidosYa)
 // @namespace    faltantes-delivery
-// @version      1.2.10
+// @version      1.2.11
 // @description  Lee que pedidos siguen activos en Rappi y PedidosYa y le avisa a Faltantes para retirar solos los ya entregados.
 // @author       Erick R.
 // @match        https://aliados.rappi.com/*
@@ -17,7 +17,7 @@
 // ==/UserScript==
 (function () {
   'use strict';
-  var VERSION = '1.2.10';
+  var VERSION = '1.2.11';
   var PUENTE = 'http://localhost:8787/api/activos';
   var host = (location.host || '');
   var PLATAFORMA = /rappi/i.test(host) ? 'Rappi' : (/restaurant-partners/i.test(host) ? 'PedidosYa' : '');
@@ -49,7 +49,7 @@
     try {
       GM_xmlhttpRequest({
         method: 'POST', url: PUENTE, headers: { 'Content-Type': 'application/json' },
-        data: JSON.stringify({ platform: PLATAFORMA, keys: claves, handedKeys: entregados, cancelledKeys: cancelados }), timeout: 4000,
+        data: JSON.stringify({ platform: PLATAFORMA, keys: claves, handedKeys: entregados, cancelledKeys: cancelados }), timeout: 10000,
         onload: function (r) {
           var ok = false;
           try { ok = r.status >= 200 && r.status < 300 && JSON.parse(r.responseText).ok === true; } catch (e) {}
